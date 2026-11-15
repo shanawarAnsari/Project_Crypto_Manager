@@ -1,0 +1,37 @@
+name: sunny
+
+# Dev override: hot reload with `docker compose -f docker-compose.yml -f docker-compose.dev.yml watch`
+services:
+  engine:
+    build:
+      target: dev
+    command: ['pnpm', '--filter', '@sunny/engine', 'dev']
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/engine/src
+          target: /app/apps/engine/src
+        - action: sync
+          path: ./packages
+          target: /app/packages
+          ignore:
+            - node_modules/
+        - action: rebuild
+          path: ./pnpm-lock.yaml
+
+  web:
+    build:
+      target: dev
+    command: ['pnpm', '--filter', '@sunny/web', 'dev']
+    develop:
+      watch:
+        - action: sync
+          path: ./apps/web/src
+          target: /app/apps/web/src
+        - action: sync
+          path: ./packages
+          target: /app/packages
+          ignore:
+            - node_modules/
+        - action: rebuild
+          path: ./pnpm-lock.yaml

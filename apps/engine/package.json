@@ -1,0 +1,22 @@
+{
+  "name": "@sunny/engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsup",
+    "start": "node dist/main.js",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.0.0",
+    "@sunny/core": "workspace:*",
+    "@sunny/db": "workspace:*",
+    "decimal.js": "*",
+    "pino": "*",
+    "zod": "*"
+  }
+}

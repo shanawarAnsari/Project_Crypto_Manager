@@ -1,0 +1,255 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TradingMode {
+  PAPER
+  LIVE
+
+  @@map("trading_mode")
+}
+
+enum OrderSide {
+  BUY
+  SELL
+
+  @@map("order_side")
+}
+
+enum OrderType {
+  MARKET
+  LIMIT
+  STOP_MARKET
+  STOP_LIMIT
+
+  @@map("order_type")
+}
+
+enum OrderStatus {
+  NEW
+  PARTIALLY_FILLED
+  FILLED
+  CANCELLED
+  REJECTED
+  EXPIRED
+
+  @@map("order_status")
+}
+
+enum PositionSide {
+  LONG
+  SHORT
+
+  @@map("position_side")
+}
+
+enum PositionStatus {
+  OPEN
+  CLOSED
+
+  @@map("position_status")
+}
+
+enum CommandStatus {
+  PENDING
+  ACKED
+  REJECTED
+
+  @@map("command_status")
+}
+
+model Symbol {
+  productId     Int      @id @map("product_id")
+  symbol        String   @unique
+  contractValue Decimal  @map("contract_value") @db.Decimal(38, 18)
+  tickSize      Decimal  @map("tick_size") @db.Decimal(38, 18)
+  lotSize       Decimal  @map("lot_size") @db.Decimal(38, 18)
+  settlingAsset String   @map("settling_asset")
+  enabledPaper  Boolean  @default(false) @map("enabled_paper")
+  enabledLive   Boolean  @default(false) @map("enabled_live")
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  candles   Candle[]
+  signals   Signal[]
+  orders    Order[]
+  positions Position[]
+
+  @@map("symbols")
+}
+
+model Candle {
+  productId Int      @map("product_id")
+  timeframe String
+  openTime  DateTime @map("open_time") @db.Timestamptz(6)
+  open      Decimal  @db.Decimal(38, 18)
+  high      Decimal  @db.Decimal(38, 18)
+  low       Decimal  @db.Decimal(38, 18)
+  close     Decimal  @db.Decimal(38, 18)
+  volume    Decimal  @db.Decimal(38, 18)
+
+  symbol Symbol @relation(fields: [productId], references: [productId])
+
+  @@id([productId, timeframe, openTime])
+  @@index([productId, timeframe, openTime(sort: Desc)])
+  @@map("candles")
+}
+
+model Signal {
+  id            String    @id @default(uuid()) @db.Uuid
+  correlationId String    @map("correlation_id") @db.Uuid
+  strategyId    String    @map("strategy_id")
+  productId     Int       @map("product_id")
+  timeframe     String
+  side          OrderSide
+  candleTime    DateTime  @map("candle_time") @db.Timestamptz(6)
+  payload       Json      @default("{}")
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  symbol Symbol @relation(fields: [productId], references: [productId])
+
+  @@index([correlationId])
+  @@index([productId, createdAt(sort: Desc)])
+  @@map("signals")
+}
+
+model Order {
+  id              String      @id @default(uuid()) @db.Uuid
+  clientOrderId   String      @unique @map("client_order_id")
+  correlationId   String      @map("correlation_id") @db.Uuid
+  productId       Int         @map("product_id")
+  side            OrderSide
+  type            OrderType
+  status          OrderStatus @default(NEW)
+  qty             Decimal     @db.Decimal(38, 18)
+  price           Decimal?    @db.Decimal(38, 18)
+  stopPrice       Decimal?    @map("stop_price") @db.Decimal(38, 18)
+  exchangeOrderId String?     @map("exchange_order_id")
+  mode            TradingMode
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  symbol Symbol @relation(fields: [productId], references: [productId])
+  fills  Fill[]
+
+  @@index([correlationId])
+  @@index([productId, createdAt(sort: Desc)])
+  @@index([status])
+  @@map("orders")
+}
+
+model Fill {
+  id             String   @id @default(uuid()) @db.Uuid
+  orderId        String   @map("order_id") @db.Uuid
+  exchangeFillId String   @unique @map("exchange_fill_id")
+  price          Decimal  @db.Decimal(38, 18)
+  qty            Decimal  @db.Decimal(38, 18)
+  fee            Decimal  @default(0) @db.Decimal(38, 18)
+  feeAsset       String   @default("INR") @map("fee_asset")
+  filledAt       DateTime @map("filled_at") @db.Timestamptz(6)
+
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([filledAt(sort: Desc)])
+  @@map("fills")
+}
+
+model Position {
+  id         String         @id @default(uuid()) @db.Uuid
+  productId  Int            @map("product_id")
+  side       PositionSide
+  qty        Decimal        @db.Decimal(38, 18)
+  entryPrice Decimal        @map("entry_price") @db.Decimal(38, 18)
+  stopPrice  Decimal?       @map("stop_price") @db.Decimal(38, 18)
+  status     PositionStatus @default(OPEN)
+  openedAt   DateTime       @default(now()) @map("opened_at") @db.Timestamptz(6)
+  closedAt   DateTime?      @map("closed_at") @db.Timestamptz(6)
+
+  symbol Symbol  @relation(fields: [productId], references: [productId])
+  trades Trade[]
+
+  @@index([productId, status])
+  @@map("positions")
+}
+
+model Trade {
+  id            String    @id @default(uuid()) @db.Uuid
+  positionId    String    @map("position_id") @db.Uuid
+  correlationId String    @map("correlation_id") @db.Uuid
+  entryPrice    Decimal   @map("entry_price") @db.Decimal(38, 18)
+  exitPrice     Decimal?  @map("exit_price") @db.Decimal(38, 18)
+  pnlInr        Decimal?  @map("pnl_inr") @db.Decimal(38, 18)
+  feesInr       Decimal   @default(0) @map("fees_inr") @db.Decimal(38, 18)
+  strategyId    String    @map("strategy_id")
+  notes         String?
+  openedAt      DateTime  @map("opened_at") @db.Timestamptz(6)
+  closedAt      DateTime? @map("closed_at") @db.Timestamptz(6)
+
+  position Position @relation(fields: [positionId], references: [id])
+
+  @@index([correlationId])
+  @@index([openedAt(sort: Desc)])
+  @@map("trades")
+}
+
+model RiskEvent {
+  id            String   @id @default(uuid()) @db.Uuid
+  correlationId String?  @map("correlation_id") @db.Uuid
+  rule          String
+  severity      String
+  details       Json     @default("{}")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([createdAt(sort: Desc)])
+  @@map("risk_events")
+}
+
+model AuditLog {
+  id            String   @id @default(uuid()) @db.Uuid
+  correlationId String?  @map("correlation_id") @db.Uuid
+  actor         String
+  action        String
+  entity        String?
+  entityId      String?  @map("entity_id")
+  details       Json     @default("{}")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([correlationId])
+  @@index([createdAt(sort: Desc)])
+  @@map("audit_logs")
+}
+
+// Singleton row: id is always 1 (enforced by a CHECK constraint in the migration).
+model EngineState {
+  id                    Int         @id @default(1)
+  mode                  TradingMode @default(PAPER)
+  tradingEnabled        Boolean     @default(false) @map("trading_enabled")
+  killSwitch            Boolean     @default(false) @map("kill_switch")
+  killSwitchReason      String?     @map("kill_switch_reason")
+  heartbeatAt           DateTime?   @map("heartbeat_at") @db.Timestamptz(6)
+  clockOffsetMs         Int?        @map("clock_offset_ms")
+  instanceId            String?     @map("instance_id")
+  instanceLockExpiresAt DateTime?   @map("instance_lock_expires_at") @db.Timestamptz(6)
+  updatedAt             DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("engine_state")
+}
+
+model Command {
+  id          String        @id @default(uuid()) @db.Uuid
+  type        String
+  payload     Json          @default("{}")
+  status      CommandStatus @default(PENDING)
+  requestedAt DateTime      @default(now()) @map("requested_at") @db.Timestamptz(6)
+  ackedAt     DateTime?     @map("acked_at") @db.Timestamptz(6)
+  result      Json?
+
+  @@index([status, requestedAt])
+  @@map("commands")
+}
