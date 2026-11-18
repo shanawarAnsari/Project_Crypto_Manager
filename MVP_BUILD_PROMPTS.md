@@ -18,6 +18,14 @@ Use strict TypeScript, Express, `better-sqlite3` in WAL mode, Zod, `technicalind
 
 ### 2.3 Risk and execution
 
+Latest owner Demo revision (2026-11-18) supersedes older Demo figures in this document:
+100% USD-equity margin including entry fees, <=100x leverage bounded by saved/configured/product
+limits, planned stop plus round-trip fees <=30% total USD equity (replaces the proposed 50%-of-margin
+rule), five UTC attempts unchanged, 50% start-of-day daily loss bounded by MAX_DAILY_LOSS.
+Preserve lower caps/default 2x; no upward migration. Production/legacy ceiling stays 2x.
+Tests select whole leverage 1..100/default 1, use one contract and may narrow initial 1%/2% brackets
+to fit equity/daily budgets, with exact prices confirmed before execution. See latest master amendment.
+
 Owner leverage update: 2x is the hard maximum across configuration, API, AI, risk, execution, and gateway, superseding the earlier 3x ceiling below. Lower limits remain valid. Legacy persisted limits above 2x are reduced during database initialization with automation paused; existing exchange positions are not changed.
 
 Implement `meanReversion`, `trendBreakout`, `gridScalper`, and `flat` signals. Risk rules—not AI—clamp leverage and enforce a UTC daily-loss breaker. An order requires a valid `RiskApproval`; only the execution module may submit it.
@@ -29,14 +37,40 @@ AI may configure strategy parameters only within operator risk caps; determinist
 Owner amendment 2026-11-17: replace the deck with a persistent Demo-only chat trading agent and
 live activity summaries. The agent directly proposes wait/open/hold/owned-close actions, with
 independent risk/execution enforcement. Combined timeframe/cadence selector defaults to 5m
-(1m/5m/15m/30m/1h). Disable legacy worker entries. Owner policy: <=25% USD equity as margin,
+(1m/5m/15m/30m/1h). Disable legacy worker entries. Owner policy: <=40% USD equity as margin,
 <=2x leverage, stop loss plus tax-inclusive round-trip fees <=5% of allocation, <=5 UTC entries,
 10% Demo daily loss cap still bounded by MAX_DAILY_LOSS. No production agent orders.
 See the master specification's Demo chat agent contract for lifecycle and reconciliation rules.
+Current reconciled account/ownership state overrides historical conversation. Model context includes
+explicit position state and allowed actions; HOLD/CLOSE without verified owned exposure is rejected
+before display/accepted audit, and HOLD rechecks fresh ownership. Chat reconciles read-only too.
+Missing telemetry remains unknown; preserve history and fail-closed invalid-response handling.
+
+Owner-requested execution test: a separate Demo-only preview/explicit-confirmation control may
+propose one BTCUSD contract at operator-selected 1x or 2x (default 1x) without waiting for a strategy signal. It retains all existing
+risk checks, Start/lock gating, mandatory exchange stop/target, durable ownership and read-back.
+Tokens are one-use and expire after 30 seconds; preview never submits and no production test is
+allowed. Display verified entry/stop/target on the chart and poll exchange per-position unrealized
+USD PnL every five seconds, hiding unavailable telemetry. See the master specification's test contract.
+Owner margin amendment: the 40% cap applies to both Demo scheduled and test entries, superseding
+25%; test leverage defaults to 1x and every other risk limit/confirmation remains unchanged. No production change.
+Owner test leverage amendment (2026-11-18): allow 1x/2x selection before preview, bound to its token
+and revalidated unchanged at confirmation against all configured caps. Cancel to change a preview.
+Owner manual-close revision (2026-11-18) supersedes external-position close-all: separately confirm
+closing only app-owned Demo BTCUSD trades using exact-size reduce-only owned-exit execution.
+Drain/serialize work and invalidate stale proposals; preserve running/paused/locked controls on
+verified success. Automation may enter again on a later valid signal. Never cancel external orders
+or close external/mixed exposure; no owned trade is a no-op. Failures/uncertainty pause and lock.
+Manual risk approvals support paused/locked exits without enabling entries. No blanket cancellation,
+account-wide close-all, automatic retry or automatic unlock. See master specification for read-back.
 
 Send compact multi-timeframe market context and operator instruction to NVIDIA NIM with low temperature. Validate a strict strategy/parameter/reasoning schema with Zod. Persist raw-safe request context and parsed decisions; never store credentials or authorization headers. Invalid or unavailable AI output must not enable execution.
 
 ### 2.5 Frontend
+
+Agent Chat follows the newest message: scroll its bounded conversation viewport to the bottom on
+initial history and each message/activity update, including reconnect/polling refreshes. New updates
+resume latest-message following after manual upward scrolling; do not move dashboard scroll or focus.
 
 Owner presentation update: retain Wallet portfolio (indicative) and USD trading wallet cards; omit the Wallet Holdings panel and successful live-account verification sentence. Keep account/portfolio errors visible. Show the configured leverage cap (at most 2x), not a fabricated position leverage.
 

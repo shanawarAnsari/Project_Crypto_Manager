@@ -99,6 +99,8 @@ export interface Order {
   type: string;
   quantity: string;
   limitPrice: string | null;
+  stopOrderType: string | null;
+  triggerPrice: string | null;
   status: string;
   createdAt: string;
 }

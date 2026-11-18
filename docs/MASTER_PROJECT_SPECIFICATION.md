@@ -4,14 +4,50 @@ Current behavior is defined by the **Owner-approved Demo chat agent (2026-11-17)
 It supersedes earlier strategy-deck, hourly-only automation, AI-config-only and Demo 2% descriptions.
 Production agent execution is not enabled. Retained deterministic APIs are compatibility surfaces only.
 
+### Latest owner Demo policy revision (2026-11-18)
+
+This supersedes earlier Demo 40% margin / 2x leverage / 5%-of-margin planned loss / 10% daily loss
+descriptions below. Both scheduled Demo entries and explicit one-contract test entries permit:
+- Margin including the entry-fee reserve <=100% of verified USD equity, also available-margin bounded.
+- Leverage <=100x AND lower saved/configured caps AND the verified product limit (100 / initial_margin).
+  Preserve existing lower caps, including the default 2x; never silently migrate them upward.
+- Planned stop loss plus tax-inclusive estimated round-trip fees <=30% of total verified USD equity.
+  This REPLACES the proposed 50%-of-margin budget; size down to fit it and remaining daily budget.
+- At most five entry attempts per UTC day (unknown submissions still count).
+- Daily loss <=50% of start-of-day USD capital, still bounded by MAX_DAILY_LOSS.
+Production/legacy policy remains 2x and unchanged. Demo MAX_LEVERAGE may be explicitly configured
+up to 100; omission still defaults to 2. A higher policy ceiling is not permission to bypass lower caps.
+Test leverage selects whole values 1..100, default 1. Start with 1% stop / 2% target; when necessary
+narrow both to fit the smaller equity/daily planned-loss budget after fees, using decimal math and
+tick alignment. Refuse nonviable brackets/fee budgets rather than fabricate protection. Bind exact
+previewed leverage/brackets to confirmation and refresh every risk input; no silent confirmation
+adjustments. Preserve stops/targets, one-contract test cap, risk approvals, Demo-only operation,
+ownership, fail-closed read-back, restart-paused controls and no automatic retry.
+These are planned budgets, not guaranteed maximum losses: leverage, liquidation, gaps and fees
+can exhaust equity before a stop executes. UI must disclose high-leverage Demo risk.
+
+Owner margin-policy amendment (2026-11-17): raise the Demo margin cap from 25% to 40% of
+verified USD trading equity for both scheduled agent entries and explicit one-contract test entries.
+The cap includes the entry-fee reserve and remains bounded by available margin. This is a ceiling,
+not a mandatory allocation; lower model proposals remain valid. All other limits are unchanged:
+test entries default to 1x (operator-selectable 1x/2x), leverage ceiling 2x, planned stop plus fees <=5% of actual allocated margin,
+five UTC entry attempts and 10% Demo daily loss bounded by MAX_DAILY_LOSS. Keep Demo-only execution,
+fresh approvals, mandatory exchange stop/target, restart-paused controls and explicit test confirmation.
+Production policy is unchanged. This supersedes earlier Demo 25% allocation descriptions.
+
 ### Owner-approved Demo execution test (2026-11-17)
 
 Provide a two-step test-entry control, separate from chat and scheduled signals. Preview performs
 read-only exchange/risk checks and returns a one-use, 30-second confirmation token plus the proposed
-BTCUSD side, one whole contract, 1x leverage and tick-aligned stop/target. The operator selects BUY
+BTCUSD side, one whole contract, selected leverage and tick-aligned stop/target. The operator selects BUY
 or SELL; initial stop/target distances are 1%/2% for this plumbing test, not a strategy recommendation.
 Only explicit confirmation may submit. Refresh account, product, fees and price and obtain a fresh
 RiskApproval at confirmation; never enlarge beyond one contract or relax any existing limit.
+Owner leverage amendment (2026-11-18): the Demo test UI selects 1x (default) or 2x before preview.
+The preview API accepts optional numeric `leverage` (1 or 2, omitted defaults to 1 for compatibility).
+Bind leverage to the one-use preview; selection is locked until cancellation/expiry. Confirmation
+must preserve that leverage and revalidate lower configured caps, never silently clamp or raise it.
+This changes only explicit Demo test entries, not scheduled policy or production behavior.
 Require an explicitly started, unlocked Demo bot, no existing exposure/orders/unresolved submission,
 and unchanged controls. Reject Live, expired/reused tokens, insufficient margin/budget and unsafe brackets.
 Use the normal execution, durable ownership, attempt counting and read-back path; unknown submissions
@@ -23,6 +59,30 @@ profit). Refresh account/PnL every five seconds; hide position overlays/PnL on u
 Do not invent protection from a proposal: for owned trades, use authenticated exact-order/position
 read-back when the position endpoint omits bracket prices. Missing/mismatched protection is an
 explicit account/verification error, never a confirmed protected fill.
+
+Owner manual-close revision (2026-11-18): supersedes the earlier external-position close-all
+exception. **Close app-owned Demo BTCUSD trades** closes only authenticated app-owned BTCUSD
+exposure (scheduled or test entries), after separate explicit confirmation. Never adopt or mutate
+manual/external positions or orders, other products or Live accounts. Invalidate previews/decisions
+and serialize/drain agent work, but do not pause or lock on success: running automation continues
+on its normal schedule and can enter again on a later valid signal. Preserve paused/locked states;
+never silently enable or unlock. Reject uncertain ownership, mixed same-product exposure, pending
+submissions and residual orders. Use fresh exact-size one-use manual-owned-close risk approval via
+execution, signed-position recheck and reduce-only market submission, not emergency cancellation or
+account-wide close-all. Verify completed close order and flat owned exposure before success.
+No owned trade is an explicit no-op, leaving external exposure untouched. Do not blanket-cancel
+orders; protective orders must reconcile as gone after exit or fail closed for operator attention.
+Block overlaps/Start/reset while closing; explicit Stop is never undone. Allow manual exits while
+paused/locked or without an LLM. Failures/uncertain read-back pause and lock without automatic retry.
+Development verification must not trigger actual exchange actions.
+
+Open-order display: carry the exchange's `stop_order_type` and `stop_price` through the adapter
+and dashboard. Label `stop_loss_order` as Stop loss and `take_profit_order` as Take profit / target,
+show their trigger prices separately from execution type and limit price, and explain pending
+conditional orders as awaiting trigger while preserving the raw exchange status. Unknown/missing
+types must not be inferred from side, price proximity or the existence of a position; show them
+as unclassified conditional orders when trigger metadata exists. Missing trigger prices are
+explicitly unavailable, never "Market". Display-only: no order changes, cancellation or resubmission.
 
 ## Purpose and status
 
@@ -59,10 +119,21 @@ Trading overview presentation: make the indicative portfolio total the visual le
 ### Owner-approved Demo chat agent (2026-11-17)
 
 Replace the strategy deck with a persistent NVIDIA chat and a live, resumable activity feed.
+Owner chat-scroll update (2026-11-18): open loaded conversation history at its newest message and
+automatically scroll the conversation's own scrollbar to the bottom after every message/activity
+update (including polling/reconnect history), even if the operator previously scrolled upward.
+Keep the bounded scrollable history; do not scroll the surrounding dashboard or move input focus.
 Show observable steps and concise decision summaries, never private model reasoning.
 Each chat/review displays the complete validated LLM decision (action, summary and all proposed
 entry fields), distinct from system context, risk, submission and exchange-confirmation updates.
 There is one LLM call per chat/review, not an LLM response at every deterministic stage.
+Position-state correction (2026-11-18): current authenticated account/owned-order reconciliation
+is authoritative, never prior assistant/user messages or historical trade theses. Supply explicit
+verified position state and allowed actions to the model. HOLD/CLOSE require a confirmed open owned
+trade; flat accounts must WAIT or propose an eligible OPEN. Recheck ownership before publishing a
+HOLD; reject contradictory actions before accepted audit/user-facing output, log the discrepancy
+and fail closed without retries. Chat also reconciles saved ownership read-only and never authorizes
+orders; missing telemetry is unknown, not flat or proof of a saved active trade. Retain history.
 Never display unvalidated provider output or claim a submission acknowledgement is a confirmed fill.
 One selector controls closed-candle timeframe and review cadence (1m/5m/15m/30m/1h; default 5m).
 The agent proposes wait, open long/short, hold, or close its own position; only execution acts,
@@ -70,7 +141,7 @@ after independent risk approval. The legacy deterministic worker must not place 
 Chat itself never enables trading or submits an order. Start remains explicit and restart pauses.
 This new agent is Demo-only; production agent execution is prohibited.
 
-Owner risk amendment: allocate at most 25% of verified USD trading equity as margin, additionally
+Owner risk amendment: allocate at most 40% of verified USD trading equity as margin, additionally
 bounded by available margin. Leverage is at most 2x and respects lower persisted limits.
 Planned stop loss plus estimated round-trip taker fees (including tax) must fit within 5% of
 allocated margin. At most five entry attempts per UTC day; uncertain submissions count and block

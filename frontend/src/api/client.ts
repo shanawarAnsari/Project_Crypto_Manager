@@ -113,15 +113,20 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ timeframe }),
     }),
-  previewTestEntry: (side: "buy" | "sell") =>
+  previewTestEntry: (side: "buy" | "sell", leverage: number) =>
     request<DemoTestEntryPreview>("/api/agent/test-entry/preview", {
       method: "POST",
-      body: JSON.stringify({ side }),
+      body: JSON.stringify({ side, leverage }),
     }),
   confirmTestEntry: (token: string) =>
     request<AgentSnapshot>("/api/agent/test-entry/confirm", {
       method: "POST",
       body: JSON.stringify({ token, confirmation: "PLACE_DEMO_TEST_ORDER" }),
+    }),
+  closeAllDemoPositions: () =>
+    request<AgentSnapshot>("/api/agent/close-all", {
+      method: "POST",
+      body: JSON.stringify({ confirmation: "CLOSE_OWNED_DEMO_BTCUSD" }),
     }),
   agentEvents: (after?: number) =>
     new EventSource(`/api/agent/events${after === undefined ? "" : `?after=${after}`}`),

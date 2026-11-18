@@ -128,6 +128,26 @@ function start(app: ReturnType<typeof createApp>): Promise<string> {
 }
 
 describe("backend safety and API", () => {
+  it("passes exchange order purpose and trigger prices through the dashboard without relabeling status", async () => {
+    const services = trackDb(testSystem());
+    services.config = { ...services.config, deltaApiKey: "test", deltaApiSecret: "test" };
+    vi.spyOn(services.delta, "getAccountRiskSnapshot").mockResolvedValue({
+      equity: "198", availableMargin: "130", marginUsed: "64", unrealizedPnl: "0", realizedPnl: "0", positions: [],
+      openOrders: [
+        { id: "stop", productId: 27, symbol: "BTCUSD", side: "buy", orderType: "market_order", quantity: "1",
+          stopOrderType: "stop_loss_order", triggerPrice: "64463.8", limitPrice: null, status: "pending", createdAt: "" },
+        { id: "target", productId: 27, symbol: "BTCUSD", side: "buy", orderType: "market_order", quantity: "1",
+          stopOrderType: "take_profit_order", triggerPrice: "62549.1", limitPrice: null, status: "pending", createdAt: "" }
+      ]
+    });
+    vi.spyOn(services.delta, "getPortfolioValuation").mockResolvedValue({ totalUsd: "198", totalInr: "16830", holdings: [] });
+    const url = await start(createApp(services));
+    const result = await (await fetch(`${url}/api/dashboard`)).json();
+    expect(result).toMatchObject({ accountStatus: "available", orders: [
+      { id: "stop", stopOrderType: "stop_loss_order", triggerPrice: "64463.8", status: "pending", type: "market_order" },
+      { id: "target", stopOrderType: "take_profit_order", triggerPrice: "62549.1", status: "pending", type: "market_order" }
+    ] });
+  });
   it("uses environment-specific BTCUSD products and ignores legacy environment selectors", () => {
     const config = loadConfig({});
     expect(config.port).toBe(4000);
@@ -1076,12 +1096,12 @@ describe("backend safety and API", () => {
         success: true,
         result: {
           id: 84, symbol: "BTCUSD", state: "live", trading_status: "operational",
-          contract_value: "0.001", tick_size: "0.1"
+          contract_value: "0.001", tick_size: "0.1", initial_margin: "0.5"
         }
       });
     });
     await expect(testnet.getProductSpec()).resolves.toEqual({
-      symbol: "BTCUSD", contractValue: "0.001", tickSize: "0.1", live: true
+      symbol: "BTCUSD", contractValue: "0.001", tickSize: "0.1", live: true, maxLeverage: "200"
     });
     expect(requests).toEqual(["https://cdn-ind.testnet.deltaex.org/v2/products/BTCUSD"]);
 
@@ -1174,6 +1194,7 @@ describe("backend safety and API", () => {
       openOrders: [{
         id: "41", productId: 27, symbol: "BTCUSD", side: "sell",
         orderType: "limit_order", quantity: "1", limitPrice: "106", status: "open",
+        stopOrderType: null, triggerPrice: null,
         createdAt: "2026-01-01T00:00:00Z"
       }]
     });
@@ -1274,7 +1295,7 @@ describe("backend safety and API", () => {
     if (!decision.approved) return;
     expect(consumeRiskApproval(decision.approval)).toBe(true);
     const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
-    const spec = { symbol: "BTCUSD", contractValue: "0.001", tickSize: "0.5", live: true };
+    const spec = { symbol: "BTCUSD", contractValue: "0.001", tickSize: "0.5", live: true, maxLeverage: "200" };
     const gateway = new DeltaIndiaTestnetOrderGateway({
       apiKey: "k", apiSecret: "s", productId: 27, environment: "production"
     }, async (input, init) => {
@@ -1320,11 +1341,18 @@ describe("backend safety and API", () => {
   it("derives the daily loss cap as a percentage of start-of-day capital", () => {
     const services = trackDb(testSystem());
     const synced = syncDailyLossCap(services, { equity: "950", realizedPnl: "-50", unrealizedPnl: "0" });
-    expect(synced.maxDailyLoss).toBe("100");
+    expect(synced.maxDailyLoss).toBe("500");
     const withUnrealized = syncDailyLossCap(services, { equity: "950", realizedPnl: "-50", unrealizedPnl: "-20" });
-    expect(withUnrealized.maxDailyLoss).toBe("100");
+    expect(withUnrealized.maxDailyLoss).toBe("500");
     const capped = syncDailyLossCap(services, { equity: "1000000", realizedPnl: "0", unrealizedPnl: "0" });
     expect(capped.maxDailyLoss).toBe("1000");
+    const below = syncDailyLossCap(services, { equity: "500.00001", realizedPnl: "-499.99999", unrealizedPnl: "0" });
+    expect(below.maxDailyLoss).toBe("500");
+    expect(services.risk.dailyLossBreached(below, "0", "-499.99999")).toBe(false);
+    const boundary = syncDailyLossCap(services, { equity: "500", realizedPnl: "-500", unrealizedPnl: "0" });
+    expect(services.risk.dailyLossBreached(boundary, "0", "-500")).toBe(true);
+    services.config = { ...services.config, deltaEnvironment: "production" };
+    expect(syncDailyLossCap(services, { equity: "1000", realizedPnl: "0", unrealizedPnl: "0" }).maxDailyLoss).toBe("20");
   });
 
   it("fails closed on missing testnet credentials and transport/provider errors", async () => {

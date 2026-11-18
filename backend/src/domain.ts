@@ -1,4 +1,12 @@
 export const MAX_LEVERAGE = 2;
+export const DEMO_MAX_MARGIN_PERCENT = 100;
+export const DEMO_MAX_LEVERAGE = 100;
+export const DEMO_MAX_PLANNED_LOSS_PERCENT = 30;
+export const DEMO_DAILY_LOSS_PERCENT = 50;
+
+export function leverageCeiling(environment: "production" | "testnet"): number {
+  return environment === "testnet" ? DEMO_MAX_LEVERAGE : MAX_LEVERAGE;
+}
 export const TIMEFRAMES = ["1h", "4h", "1d", "1w"] as const;
 export type Timeframe = (typeof TIMEFRAMES)[number];
 /** Display-only intervals plus the strategy intervals; strategies never consume intraday chart candles. */
@@ -68,6 +76,7 @@ export interface EmergencyCloseApproval {
 }
 
 export interface AgentCloseApproval {
+  readonly intent: "agent-close" | "manual-owned-close";
   readonly approvalId: string;
   readonly productId: number;
   readonly side: Side;

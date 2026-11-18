@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import type { DemoTestEntryPreview } from "../domain/types";
+import { DemoCloseAll } from "./DemoCloseAll";
 
-export function DemoTestEntry({ enabled, onPreview, onConfirm }: {
+export function DemoTestEntry({ enabled, onPreview, onConfirm, closeAllControl }: {
   enabled: boolean;
-  onPreview: (side: "buy" | "sell") => Promise<DemoTestEntryPreview>;
+  onPreview: (side: "buy" | "sell", leverage: number) => Promise<DemoTestEntryPreview>;
   onConfirm: (token: string) => Promise<void>;
+  closeAllControl?: { enabled: boolean; onCloseAll: () => Promise<void> };
 }) {
   const [side, setSide] = useState<"buy" | "sell">("buy");
+  const [leverage, setLeverage] = useState(1);
   const [preview, setPreview] = useState<DemoTestEntryPreview | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -32,8 +35,8 @@ export function DemoTestEntry({ enabled, onPreview, onConfirm }: {
     setError(null);
     setResult(null);
     try {
-      const quote = await onPreview(side);
-      if (!quote.token || quote.side !== side || quote.contracts !== "1" || quote.leverage !== 1 ||
+      const quote = await onPreview(side, leverage);
+      if (!quote.token || quote.side !== side || quote.contracts !== "1" || quote.leverage !== leverage ||
           !Number.isFinite(quote.expiresAt) || quote.expiresAt <= Date.now()) {
         throw new Error("Invalid or expired test preview. No order was authorized.");
       }
@@ -64,7 +67,8 @@ export function DemoTestEntry({ enabled, onPreview, onConfirm }: {
   return (
     <section aria-label="Demo execution test" className="space-y-2 rounded border border-amber-700/50 p-3 text-xs">
       <h3 className="font-bold text-amber-200">Demo execution test</h3>
-      <p>Signal-free plumbing test: one BTCUSD contract at 1x, initial 1% stop / 2% target.
+      <p>Signal-free plumbing test: one BTCUSD contract at selected leverage (maximum 100x), initial 1% stop / 2% target,
+        narrowed if needed to fit planned-loss budgets.
         All risk limits still apply. Not a trading recommendation. The position is not automatically closed.</p>
       <p>Requires a running, unlocked Demo bot, verified account and no existing exposure or orders.</p>
       <label className="field-label" htmlFor="demo-test-side">
@@ -75,6 +79,16 @@ export function DemoTestEntry({ enabled, onPreview, onConfirm }: {
           <option value="sell">SELL / short</option>
         </select>
       </label>
+      <label className="field-label" htmlFor="demo-test-leverage">
+        Test leverage
+        <select id="demo-test-leverage" className="terminal-input" value={leverage} disabled={!enabled || pending || !!preview}
+          onChange={(event) => setLeverage(Number(event.target.value))}>
+          {Array.from({ length: 100 }, (_, index) => index + 1).map((value) =>
+            <option key={value} value={value}>{value}x</option>)}
+        </select>
+      </label>
+      <p>Default 1x. Lower saved, configured and exchange caps still apply. Cancel a preview to change leverage.
+        High leverage can liquidate the Demo position before a stop executes; inspect exact preview prices.</p>
       {!preview && <button className="terminal-button" disabled={!enabled || pending} onClick={() => void prepare()}>
         Preview Demo test (no order)
       </button>}
@@ -91,6 +105,10 @@ export function DemoTestEntry({ enabled, onPreview, onConfirm }: {
       {pending && <p role="status">Checking Demo test request...</p>}
       {error && <p role="alert" className="text-rose-300">{error}</p>}
       {result && <p role="status">{result}</p>}
+      {closeAllControl && <DemoCloseAll enabled={closeAllControl.enabled} onCloseAll={async () => {
+        setPreview(null);
+        await closeAllControl.onCloseAll();
+      }} />}
     </section>
   );
 }

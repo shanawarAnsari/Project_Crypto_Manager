@@ -1,6 +1,6 @@
 import Decimal from "decimal.js";
 import type { AgentCloseApproval, BotState, EmergencyCloseApproval, RiskApproval } from "../domain.js";
-import { MAX_LEVERAGE } from "../domain.js";
+import { leverageCeiling } from "../domain.js";
 import type { TradeRepository } from "../persistence/repositories.js";
 import { consumeAgentCloseApproval, consumeEmergencyCloseApproval, consumeRiskApproval } from "../risk-core/risk-core.js";
 import type { TestnetOrderGateway } from "./delta-order-gateway.js";
@@ -14,7 +14,8 @@ export class ExecutionService {
   ) {}
 
   async closeAgentPosition(approval: AgentCloseApproval, state: BotState): Promise<void> {
-    if (this.config.deltaEnvironment !== "testnet" || !state.enabled || state.killSwitch ||
+    if (this.config.deltaEnvironment !== "testnet" ||
+        (approval.intent !== "manual-owned-close" && (!state.enabled || state.killSwitch)) ||
         approval.productId !== this.config.deltaProductId || !consumeAgentCloseApproval(approval) ||
         !this.orderGateway.closeAgentPosition) {
       throw new Error("Demo agent close was refused by execution");
@@ -46,7 +47,7 @@ export class ExecutionService {
     if (!state.enabled || state.killSwitch) throw new Error("Execution refused: bot is disabled or kill switch is active");
     if (approval.productId !== this.config.deltaProductId) throw new Error("Execution refused: approved product does not match configured product");
     if (!Number.isFinite(approval.leverage) || approval.leverage <= 0 ||
-        approval.leverage > Math.min(this.config.maxLeverage, state.maxLeverage, MAX_LEVERAGE)) {
+        approval.leverage > Math.min(this.config.maxLeverage, state.maxLeverage, leverageCeiling(this.config.deltaEnvironment))) {
       throw new Error("Execution refused: approved leverage exceeds configured limits");
     }
     if (this.trades.hasPendingSubmission(approval.productId)) {

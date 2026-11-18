@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import Decimal from "decimal.js";
 import type { AgentCloseApproval, BotState, EmergencyCloseApproval, RiskApproval, TradingSignal } from "../domain.js";
-import { MAX_LEVERAGE } from "../domain.js";
+import { DEMO_MAX_MARGIN_PERCENT, DEMO_MAX_PLANNED_LOSS_PERCENT, MAX_LEVERAGE, leverageCeiling } from "../domain.js";
 
 const issuedApprovals = new WeakSet<object>();
 const consumedApprovals = new WeakSet<object>();
@@ -17,6 +17,7 @@ export interface AgentEntryInput {
   realizedPnl: string; unrealizedPnl: string; feeRate: string; contractValue: string;
   tickSize: string; entryCount: number; marginPercent?: string;
   maxContracts?: number;
+  exchangeMaxLeverage: string;
 }
 
 export type RiskDecision =
@@ -27,11 +28,13 @@ export class RiskCore {
   private readonly maxDailyLoss: Decimal;
   constructor(
     maxDailyLoss: string,
-    private readonly maxLeverage: number
+    private readonly maxLeverage: number,
+    private readonly environment: "production" | "testnet" = "production"
   ) {
     this.maxDailyLoss = new Decimal(maxDailyLoss);
     if (!this.maxDailyLoss.isFinite() || this.maxDailyLoss.lte(0)) throw new Error("Risk limit must be positive");
-    if (!Number.isFinite(maxLeverage) || maxLeverage <= 0 || maxLeverage > MAX_LEVERAGE) throw new Error(`Leverage cap must be in (0, ${MAX_LEVERAGE}]`);
+    const ceiling = leverageCeiling(environment);
+    if (!Number.isFinite(maxLeverage) || maxLeverage <= 0 || maxLeverage > ceiling) throw new Error(`Leverage cap must be in (0, ${ceiling}]`);
   }
 
   dailyLossBreached(state: BotState, unrealizedPnl?: string, realizedPnl?: string): boolean {
@@ -53,7 +56,7 @@ export class RiskCore {
       if (!Number.isInteger(input.entryCount) || input.entryCount < 0 || input.entryCount >= 5) return reject("Five-entry UTC daily limit reached");
       if (!Number.isSafeInteger(input.productId) || input.productId <= 0 ||
           !Number.isFinite(input.leverage) || input.leverage < 1 ||
-          input.leverage > Math.min(this.maxLeverage, state.maxLeverage, MAX_LEVERAGE)) return reject("Invalid product or leverage cap");
+          input.leverage > Math.min(this.maxLeverage, state.maxLeverage, leverageCeiling(this.environment))) return reject("Invalid product or leverage cap");
       if (this.dailyLossBreached(state, input.unrealizedPnl, input.realizedPnl)) return reject("UTC daily-loss circuit breaker is active");
       try {
         const entry = new Decimal(input.entryPrice);
@@ -62,8 +65,11 @@ export class RiskCore {
         const tick = new Decimal(input.tickSize);
         const equity = new Decimal(input.equity);
         const available = new Decimal(input.availableMargin);
-        const allocation = new Decimal(input.marginPercent ?? "25");
-        if (!allocation.isFinite() || allocation.lte(0) || allocation.gt(25)) return reject("Margin allocation exceeds 25% of USD equity");
+        const allocation = new Decimal(input.marginPercent ?? DEMO_MAX_MARGIN_PERCENT);
+        const exchangeMaxLeverage = new Decimal(input.exchangeMaxLeverage);
+        if (!exchangeMaxLeverage.isFinite() || exchangeMaxLeverage.lt(1) ||
+            exchangeMaxLeverage.lt(input.leverage)) return reject("Requested leverage exceeds the verified exchange product cap");
+        if (!allocation.isFinite() || allocation.lte(0) || allocation.gt(DEMO_MAX_MARGIN_PERCENT)) return reject(`Margin allocation exceeds ${DEMO_MAX_MARGIN_PERCENT}% of USD equity`);
         if ([entry, fee, contract, tick, equity, available].some((v) => !v.isFinite() || v.lte(0)) || fee.gt("0.02")) return reject("Account, contract or fee inputs are invalid");
         const stop = new Decimal(input.stopPrice).div(tick).toDecimalPlaces(0, input.side === "buy" ? Decimal.ROUND_UP : Decimal.ROUND_DOWN).mul(tick);
         const target = new Decimal(input.takeProfitPrice).div(tick).toDecimalPlaces(0, input.side === "buy" ? Decimal.ROUND_DOWN : Decimal.ROUND_UP).mul(tick);
@@ -72,13 +78,13 @@ export class RiskCore {
         const distance = entry.minus(stop).abs();
         const feesPerUnit = entry.plus(Decimal.max(entry, stop, target)).mul(fee);
         const marginPerUnit = entry.div(input.leverage);
-        if (distance.plus(feesPerUnit).gt(marginPerUnit.mul("0.05"))) return reject("Planned stop loss plus fees exceeds 5% of allocated margin");
         if (target.minus(entry).abs().lte(feesPerUnit)) return reject("Target does not cover estimated round-trip fees");
         const remaining = Decimal.min(this.maxDailyLoss, state.maxDailyLoss).plus(input.realizedPnl).plus(input.unrealizedPnl);
         const quantity = Decimal.min(
           equity.mul(allocation).div(100).div(marginPerUnit.plus(entry.mul(fee))),
           available.div(marginPerUnit.plus(entry.mul(fee))),
           remaining.div(distance.plus(feesPerUnit)),
+          equity.mul(DEMO_MAX_PLANNED_LOSS_PERCENT).div(100).div(distance.plus(feesPerUnit)),
           input.maxContracts === undefined ? Infinity : contract.mul(input.maxContracts)
         ).div(contract).floor().mul(contract);
         if (!quantity.isFinite() || quantity.lte(0)) return reject("Approved size is below one whole exchange contract");
@@ -92,13 +98,16 @@ export class RiskCore {
       }
     }
 
-    approveAgentClose(state: BotState, productId: number, positionSide: "buy" | "sell", contracts: string): AgentCloseApproval | null {
-      if (!state.enabled || state.killSwitch || !Number.isSafeInteger(productId) || productId <= 0) return null;
+    approveAgentClose(state: BotState, productId: number, positionSide: "buy" | "sell", contracts: string,
+      intent: AgentCloseApproval["intent"] = "agent-close"): AgentCloseApproval | null {
+      if ((intent !== "agent-close" && intent !== "manual-owned-close") ||
+          (intent === "agent-close" && (!state.enabled || state.killSwitch)) ||
+          !Number.isSafeInteger(productId) || productId <= 0) return null;
       try {
         const size = new Decimal(contracts);
         if (!size.isFinite() || !size.isInteger() || size.lte(0)) return null;
       } catch { return null; }
-      const approval: AgentCloseApproval = Object.freeze({ approvalId: randomUUID(), productId,
+      const approval: AgentCloseApproval = Object.freeze({ approvalId: randomUUID(), productId, intent,
         side: positionSide === "buy" ? "sell" : "buy", contracts, issuedAt: Date.now() });
       closeApprovals.add(approval);
       return approval;
@@ -118,7 +127,7 @@ export class RiskCore {
     if (unrealizedPnl === undefined || realizedPnl === undefined) {
       return { approved: false, reason: "Account PnL reconciliation is required" };
     }
-    const leverageCap = Math.min(this.maxLeverage, state.maxLeverage);
+    const leverageCap = Math.min(this.maxLeverage, state.maxLeverage, MAX_LEVERAGE);
     if (!Number.isFinite(leverageCap) || leverageCap <= 0 ||
         !Number.isFinite(requestedLeverage) || requestedLeverage <= 0 || requestedLeverage > leverageCap) {
       return { approved: false, reason: "Requested leverage exceeds the configured cap" };

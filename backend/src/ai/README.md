@@ -2,16 +2,35 @@
 
 ## Explicit Demo execution test
 
-`POST /api/agent/test-entry/preview` accepts `{ "side": "buy" | "sell" }` and performs read-only
+Latest Demo policy revision: <=100% equity margin, <=100x leverage bounded by lower saved/configured/
+product caps, planned stop plus fees <=30% total equity, five UTC attempts, daily loss 50% bounded
+by MAX_DAILY_LOSS. This supersedes older figures below; Live/legacy remain unchanged. Test leverage
+is a whole number 1..100/default 1. Preview narrows initial 1%/2% brackets if needed to fit equity/daily
+budgets after fees; impossible tick/fee budgets reject. Exact brackets/leverage are token-bound.
+
+`POST /api/agent/test-entry/preview` accepts `{ "side": "buy" | "sell", "leverage"?: number }` and performs read-only
 checks. It returns a one-use `token`, `expiresAt`, `side`, `contracts`, `entryPrice`, `stopPrice`,
 `takeProfitPrice` and `leverage`. No LLM/signal is required. The test proposes one BTCUSD contract
-at 1x, with initial 1% stop / 2% target distances (tick-aligned by risk-core).
+at selected whole leverage 1..100 (default 1x), with initial 1% stop / 2% target distances
+(narrowed if necessary before preview, tick-aligned by risk-core).
+The token binds leverage; confirmation rechecks lower configured caps and rejects changes, never clamps.
 `POST /api/agent/test-entry/confirm` accepts `{ "token": string, "confirmation": "PLACE_DEMO_TEST_ORDER" }`.
 The token expires after 30 seconds, is consumed even on a failed confirmation and is invalid after
 restart/control changes. Confirmation refreshes risk inputs and uses normal execution and ownership
 reconciliation. Bot Start remains mandatory; Demo credentials, no exposure/orders, all margin/fee/daily
 limits and brackets remain mandatory. Preview errors are visible; uncertain submissions/read-back
 failures latch the normal risk lock. No retry or automatic test close. Scheduled management continues.
+
+The panel offers **Close app-owned Demo BTCUSD trades**.
+`POST /api/agent/close-all` requires `{ "confirmation": "CLOSE_OWNED_DEMO_BTCUSD" }`; the old literal
+is rejected. Only exact authenticated app-owned exposure is eligible, never external/manual trades.
+Invalidate previews/decisions, drain work and block overlapping work/Start/reset. Use the same
+exact-size owned-exit flow as scheduled closes, with a manual risk intent permitting paused/locked
+exits without enabling entries. No blanket cancellation or emergency close-all. Reconcile ownership,
+pending submissions, signed size and completed close/flat read-back; residual orders fail closed.
+No owned trade is a logged no-op. Success preserves controls and normal scheduling (new trades may
+occur on later signals). Never undo Stop or clear locks. Failure pauses/locks with no retry.
+Live is rejected; no LLM is required. Manual/external orders and other products are untouched.
 
 ## Demo chat agent (current dashboard)
 
@@ -22,6 +41,12 @@ review checkpoints, trade identity/thesis and resumable activity events in SQLit
 `POST /api/agent/chat` accepts a message up to 2000 characters and starts analysis only, never an order.
 The most recent 30 user/assistant messages supply bounded conversational context; the active trade
 thesis is included independently. Older messages remain in storage but are not all model context.
+Current `positionState` (unavailable, flat, external, pending or owned-open), verified `activeTrade`
+and `allowedActions` override historical conversation; older messages are never position evidence.
+Chat refreshes ownership read-only too, including completed exits while paused. Without account
+telemetry no saved trade is presented as verified. HOLD/CLOSE require verified owned-open exposure.
+Before accepting/displaying HOLD, refresh account/ownership again; reject contradictions with an
+explicit audited error using normal fail-closed handling, without retrying the model or any order.
 `POST /api/agent/settings` sets 1m/5m/15m/30m/1h (default 5m), pauses the bot and invalidates pending decisions.
 `GET /api/agent/events?after=<id>` streams persisted SSE `activity` events and supports Last-Event-ID replay.
 The UI shows observable activity and concise findings, not private internal model reasoning.
@@ -34,14 +59,14 @@ their original text; the additional detail applies to new reviews and messages.
 After explicit Start, the agent reviews fresh closed candles once per selected candle. Between reviews,
 it reconciles account risk and trade state every five seconds when not processing a model request.
 Model proposals are strict action-specific JSON: wait, hold, open or close. Opens include side, stop,
-target, leverage and a margin percentage <=25. Chat proposals are restricted to wait.
+target, leverage and a margin percentage <=100. Lower allocations remain valid. Chat proposals are restricted to wait.
 Provider errors, invalid decisions, stale data and uncertain ownership pause and latch a visible risk lock.
 There is no automatic order retry. An uncertain entry remains durable and consumes a daily attempt;
 exact client-order read-back can resolve submission status after operator attention.
 
-Only Demo agent execution is allowed. Risk independently enforces <=25% USD equity margin (entry fee
-also reserved), <=2x leverage and lower persisted caps, planned stop plus estimated tax-inclusive
-round-trip taker fees <=5% actual allocated margin, <=5 entry attempts per UTC day, and the 10% Demo
+Only Demo agent execution is allowed. Risk independently enforces <=100% USD equity margin (entry fee
+also reserved), <=100x leverage and lower persisted/configured/product caps, planned stop plus estimated tax-inclusive
+round-trip taker fees <=30% total USD equity, <=5 entry attempts per UTC day, and the 50% Demo
 daily-loss cap bounded by MAX_DAILY_LOSS. Available margin and remaining daily budget further reduce size.
 The USD wallet excludes unrealized PnL: start-of-day capital is wallet balance minus realized ledger PnL;
 daily breach compares realized plus unrealized PnL once. Ledger commissions/funding are not deducted twice.

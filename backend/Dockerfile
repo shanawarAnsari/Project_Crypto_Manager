@@ -23,4 +23,4 @@ COPY --from=build /app/backend/dist ./backend/dist
 WORKDIR /app/backend
 RUN mkdir -p /app/data
 EXPOSE 4000
-CMD ["node", "dist/src/server.js"]
+CMD ["node", "dist/src/desk-server.js"]

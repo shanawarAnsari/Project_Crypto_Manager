@@ -14,6 +14,28 @@ const state: BotState = { enabled: true, killSwitch: false, strategy: "flat", ma
   maxDailyLoss: "100", riskPerTrade: "0.5", stopLossPercent: "1", riskRewardRatio: "2", instruction: "", updatedAt: 0 };
 
 describe("NVIDIA agent adapter", () => {
+  it.each(["25", "100", "100.00001"])("validates the Demo margin boundary %s and advertises the same cap", async (marginPercent) => {
+    let systemPrompt = "";
+    const client = new OpenAI({ apiKey: "test", maxRetries: 0, fetch: async (_url, init) => {
+      const request = JSON.parse(String(init?.body)) as { messages: { role: string; content: string }[] };
+      systemPrompt = request.messages.find((message) => message.role === "system")?.content ?? "";
+      return Response.json({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify({
+        action: "open", side: "buy", stopPrice: "99000", takeProfitPrice: "102000",
+        marginPercent, leverage: 1, summary: "Demo setup."
+      }) } }] });
+    } });
+    const result = new NvidiaAgentModel("", "", "test", client).decide({}, false);
+    if (marginPercent === "100.00001") await expect(result).rejects.toThrow("invalid decision");
+    else expect(await result).toMatchObject({ action: "open", marginPercent });
+    expect(systemPrompt).toContain("marginPercent:decimal-string(>0..100)");
+    expect(systemPrompt).toContain("max100% USD equity margin");
+    expect(systemPrompt).toContain("max100x leverage");
+    expect(systemPrompt).toContain("<=30% total USD equity");
+    expect(systemPrompt).toContain("50% daily loss");
+    expect(systemPrompt).toContain("conversation is historical guidance, never proof");
+    expect(systemPrompt).toContain("Return only an action listed in allowedActions");
+    expect(systemPrompt).toContain("When flat, evaluate a new entry or WAIT");
+  });
   it("uses real provider schema and returns only a validated user-facing decision", async () => {
     const client = new OpenAI({ apiKey: "test", baseURL: "https://provider.invalid", maxRetries: 0,
       fetch: async () => Response.json({ choices: [{ finish_reason: "stop", message: { content: '{"action":"wait","summary":"No clear setup."}' } }] }) });
@@ -41,6 +63,20 @@ describe("NVIDIA agent adapter", () => {
 
 describe("verified Delta fee and order data", () => {
   const config = { apiKey: "test", apiSecret: "test", productId: 84, environment: "testnet" as const };
+  it.each([undefined, null, "0", "-1", "NaN", "101"])("refuses unverified product leverage from initial margin %s", async (initial_margin) => {
+    const client = new DeltaIndiaClient(config, async () => Response.json({ result: {
+      id: 84, symbol: "BTCUSD", state: "live", trading_status: "operational",
+      contract_value: "0.001", tick_size: "0.1", initial_margin
+    } }));
+    await expect(client.getProductSpec()).rejects.toThrow();
+  });
+  it("derives exchange leverage using its percentage initial margin", async () => {
+    const client = new DeltaIndiaClient(config, async () => Response.json({ result: {
+      id: 84, symbol: "BTCUSD", state: "live", trading_status: "operational",
+      contract_value: "0.001", tick_size: "0.1", initial_margin: "0.5"
+    } }));
+    expect((await client.getProductSpec()).maxLeverage).toBe("200");
+  });
   it("uses the verified product taker rate including India GST", async () => {
     const client = new DeltaIndiaClient(config, async () => Response.json({ success: true, result: {
       id: 84, symbol: "BTCUSD", state: "live", trading_status: "operational", taker_commission_rate: "0.0005"
@@ -71,6 +107,42 @@ describe("verified Delta fee and order data", () => {
 
 describe("risk-approved reduce-only Demo exits", () => {
   const demo = { apiKey: "test", apiSecret: "test", productId: 84, environment: "testnet" as const };
+  it.each(["success", "exchange-cap", "saved-cap", "config-cap", "production", "leverage-rejected"] as const)(
+    "enforces high leverage through risk, execution and gateway: %s", async (mode) => {
+      const db = createDatabase(":memory:");
+      try {
+        const highState = { ...state, maxLeverage: 100, maxDailyLoss: "500" };
+        const risk = new RiskCore("1000", 100, "testnet");
+        const result = risk.approveAgentEntry(highState, {
+          productId: 84, side: "buy", entryPrice: "100000", stopPrice: "99000", takeProfitPrice: "102000",
+          leverage: 100, exchangeMaxLeverage: "200", equity: "1000", availableMargin: "1000",
+          realizedPnl: "0", unrealizedPnl: "0", feeRate: "0.00059", contractValue: "0.001", tickSize: "0.1",
+          entryCount: 0, maxContracts: 1
+        });
+        if (!result.approved) throw new Error(result.reason);
+        const calls: string[] = [];
+        const gateway = new DeltaIndiaOrderGateway(demo, async (url) => {
+          calls.push(String(url));
+          if (mode === "leverage-rejected") return Response.json({ success: false, error: { code: "unsupported_leverage" } });
+          return Response.json({ success: true, result: {} });
+        }, async () => ({ symbol: "BTCUSD", live: true, contractValue: "0.001", tickSize: "0.1",
+          maxLeverage: mode === "exchange-cap" ? "50" : "200" }));
+        const config = loadConfig({ DELTA_ENV: mode === "production" ? "production" : "testnet",
+          MAX_LEVERAGE: mode === "config-cap" || mode === "production" ? "2" : "100",
+          DELTA_DEMO_API_KEY: "test", DELTA_DEMO_API_SECRET: "test" });
+        const execution = new ExecutionService(new SqliteTradeRepository(db), gateway, config);
+        const work = execution.execute(result.approval, mode === "saved-cap" ? { ...highState, maxLeverage: 2 } : highState);
+        if (mode === "success") {
+          await expect(work).resolves.toMatchObject({ status: "submitted" });
+          expect(calls).toHaveLength(2);
+          expect(calls[0]).toContain("/orders/leverage");
+          expect(calls[1]).toMatch(/\/v2\/orders$/);
+        } else {
+          await expect(work).rejects.toThrow();
+          expect(calls.some((url) => url.endsWith("/v2/orders"))).toBe(false);
+        }
+      } finally { db.close(); }
+    });
   it.each([
     { result: {} }, { result: [null] }, { result: [{ product_id: "bad", size: "1" }] },
     { result: [{ product_id: 27, size: "1" }] }, { result: [{ product_id: 84, size: "bad" }] },
@@ -94,7 +166,7 @@ describe("risk-approved reduce-only Demo exits", () => {
     if (!approval) throw new Error("Expected approval");
     consumeAgentCloseApproval(approval);
     const invalidProduct = new DeltaIndiaOrderGateway(demo, vi.fn(), async () => ({
-      symbol: "ETHUSD", live: true, contractValue: "0.001", tickSize: "0.5"
+      symbol: "ETHUSD", live: true, contractValue: "0.001", tickSize: "0.5", maxLeverage: "200"
     }));
     await expect(invalidProduct.closeAgentPosition(approval)).rejects.toThrow("BTCUSD");
   });
@@ -156,6 +228,35 @@ describe("risk-approved reduce-only Demo exits", () => {
       const live = new ExecutionService(trades, gateway, loadConfig({ DELTA_ENV: "production" }));
       await expect(live.closeAgentPosition(approval, state)).rejects.toThrow("refused");
       expect(gateway.closeAgentPosition).not.toHaveBeenCalled();
+    } finally { db.close(); }
+  });
+  it.each([false, true])("allows one-use manual owned exits while paused with killSwitch=%s, without changing controls", async (killSwitch) => {
+    const db = createDatabase(":memory:");
+    try {
+      const paused = { ...state, enabled: false, killSwitch };
+      const risk = new RiskCore("1000", 2);
+      expect(risk.approveAgentClose(paused, 84, "buy", "4")).toBeNull();
+      const approval = risk.approveAgentClose(paused, 84, "buy", "4", "manual-owned-close");
+      if (!approval) throw new Error("Expected manual approval");
+      expect(Object.isFrozen(approval)).toBe(true);
+      const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) =>
+        Response.json({ result: init?.method === "POST" ? {} : [{ product_id: 84, size: 4 }] }));
+      const gateway = new DeltaIndiaOrderGateway(demo, fetcher, undefined, () => false);
+      const config = loadConfig({ DELTA_ENV: "testnet", DELTA_DEMO_API_KEY: "test", DELTA_DEMO_API_SECRET: "test" });
+      const execution = new ExecutionService(new SqliteTradeRepository(db), gateway, config);
+      await expect(execution.closeAgentPosition({ ...approval }, paused)).rejects.toThrow("refused");
+      await expect(gateway.closeAgentPosition(approval)).rejects.toThrow("approval");
+      await execution.closeAgentPosition(approval, paused);
+      const post = fetcher.mock.calls.find(([, init]) => init?.method === "POST");
+      expect(JSON.parse(String(post?.[1]?.body))).toMatchObject({ product_id: 84, size: 4, side: "sell", reduce_only: "true" });
+      await expect(execution.closeAgentPosition(approval, paused)).rejects.toThrow("refused");
+      expect(fetcher.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+      expect(paused).toMatchObject({ enabled: false, killSwitch });
+      const production = new ExecutionService(new SqliteTradeRepository(db), gateway,
+        loadConfig({ DELTA_ENV: "production" }));
+      const next = risk.approveAgentClose(paused, 84, "buy", "4", "manual-owned-close");
+      if (!next) throw new Error("Expected manual approval");
+      await expect(production.closeAgentPosition(next, paused)).rejects.toThrow("refused");
     } finally { db.close(); }
   });
 });

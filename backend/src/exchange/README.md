@@ -1,11 +1,21 @@
 # Delta Exchange India adapter
 
+Product specs include maximum leverage derived using decimal math as 100 / positive initial_margin
+(a percentage). Missing/malformed/nonpositive or >100% initial margin fails closed. Risk and gateway
+reject requests above this exchange cap; Demo policy permits up to 100x, Live remains at 2x.
+
 The Demo chat agent reads verified `taker_commission_rate` from the configured live/operational
 BTCUSD product and applies the published India 18% GST multiplier. Missing or unsupported rates fail
 closed. `GET /v2/orders/client_order_id/{id}` reconciles exact client identity, whole-contract fill
 and unfilled sizes, average fill, paid commission and bracket protection before owned-trade management.
 Candle responses are normalized into chronological order before closed-candle selection.
 Actual fees already enter the daily USD wallet ledger and must not be deducted a second time.
+
+Open orders preserve `stop_order_type` as nullable `stopOrderType` and `stop_price` as nullable
+decimal-string `triggerPrice`. Known stop-loss/take-profit types identify the displayed purpose;
+unknown types remain raw/unclassified, never guessed from side or price. Invalid/nonpositive
+provided trigger prices fail account normalization; missing trigger prices remain unavailable.
+The dashboard exposes these fields without changing the exchange's raw status or execution type.
 
 The adapter pins REST, order, and market websocket requests to the configured environment: production uses `https://api.india.delta.exchange` and `wss://socket.india.delta.exchange`; Demo/testnet (default) uses `https://cdn-ind.testnet.deltaex.org` and `wss://socket-ind.testnet.deltaex.org`. Delta Global hosts cannot be selected. The UI labels the environment **LIVE** or **Demo**. Current BTCUSD product defaults are production ID `27` and Demo ID `84`; `DELTA_PRODUCT_ID` may explicitly override the selection. Before order placement, the adapter requests `GET /v2/products/BTCUSD` and rejects an ID, symbol, state, or trading status that does not match the configured live, operational BTCUSD product.
 

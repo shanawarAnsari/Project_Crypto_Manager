@@ -22,7 +22,7 @@ describe("explicit Demo test confirmation", () => {
     const s = setup();
     fireEvent.click(screen.getByRole("button", { name: "Preview Demo test (no order)" }));
     const confirm = await screen.findByRole("button", { name: "Confirm Demo BUY test order" });
-    expect(s.onPreview).toHaveBeenCalledWith("buy");
+    expect(s.onPreview).toHaveBeenCalledWith("buy", 1);
     expect(s.onConfirm).not.toHaveBeenCalled();
     expect(screen.getByRole("group")).toHaveTextContent("Stop: 99000. Target: 102000");
     fireEvent.click(confirm);
@@ -36,6 +36,42 @@ describe("explicit Demo test confirmation", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Cancel test" }));
     expect(s.onConfirm).not.toHaveBeenCalled();
     expect(screen.queryByRole("group")).not.toBeInTheDocument();
+  });
+  it("selects 2x, locks selection for its preview and unlocks on cancel", async () => {
+    const s = setup();
+    const leverage = screen.getByRole("combobox", { name: "Test leverage" });
+    expect(leverage).toHaveValue("1");
+    expect(screen.getAllByRole("option")).toHaveLength(102);
+    expect(screen.getByRole("option", { name: "100x" })).toHaveValue("100");
+    fireEvent.change(leverage, { target: { value: "2" } });
+    s.onPreview.mockResolvedValueOnce({ ...s.quote, leverage: 2 });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Demo test (no order)" }));
+    expect(await screen.findByRole("group")).toHaveTextContent("contract at 2x");
+    expect(s.onPreview).toHaveBeenCalledWith("buy", 2);
+    expect(leverage).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel test" }));
+    expect(leverage).toBeEnabled();
+    expect(s.onConfirm).not.toHaveBeenCalled();
+  });
+  it("rejects a preview whose leverage does not match the selection", async () => {
+    const s = setup();
+    fireEvent.change(screen.getByRole("combobox", { name: "Test leverage" }), { target: { value: "2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Demo test (no order)" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Invalid");
+    expect(screen.queryByRole("group")).not.toBeInTheDocument();
+    expect(s.onConfirm).not.toHaveBeenCalled();
+  });
+  it("previews 100x only on explicit selection and confirms its exact token", async () => {
+    const s = setup();
+    fireEvent.change(screen.getByRole("combobox", { name: "Test leverage" }), { target: { value: "100" } });
+    s.onPreview.mockResolvedValueOnce({ ...s.quote, leverage: 100, stopPrice: "99500", takeProfitPrice: "101000" });
+    fireEvent.click(screen.getByRole("button", { name: "Preview Demo test (no order)" }));
+    expect(await screen.findByRole("group")).toHaveTextContent("contract at 100x");
+    expect(screen.getByRole("group")).toHaveTextContent("Stop: 99500. Target: 101000");
+    expect(s.onPreview).toHaveBeenCalledWith("buy", 100);
+    expect(s.onConfirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm Demo BUY test order" }));
+    await waitFor(() => expect(s.onConfirm).toHaveBeenCalledWith(s.quote.token));
   });
   it("requires eligibility and discards a preview when controls become unavailable", async () => {
     const s = setup(false);

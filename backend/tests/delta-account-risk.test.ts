@@ -23,6 +23,43 @@ function balanceResponse() {
 }
 
 describe("Delta Demo daily realized PnL", () => {
+  it("preserves stop-loss/target order purpose, trigger price and raw pending state", async () => {
+    const orders = [
+      { id: 1, stop_order_type: "stop_loss_order", stop_price: "64463.8" },
+      { id: 2, stop_order_type: "take_profit_order", stop_price: "62549.1" },
+      { id: 3, stop_order_type: "new_conditional_type", stop_price: "63000" },
+      { id: 4, stop_order_type: null, stop_price: null },
+      { id: 5, stop_order_type: "stop_loss_order" },
+      { id: 6, stop_price: "62000" }
+    ];
+    const client = new DeltaIndiaClient(config, async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/wallet/balances")) return balanceResponse();
+      if (path.endsWith("/positions/margined")) return Response.json({ result: [] });
+      return Response.json({ result: orders.map((order) => ({
+        ...order, product_id: 27, side: "buy", size: "1", order_type: "market_order", state: "pending"
+      })), meta: { after: null } });
+    });
+    const result = await client.getAccountSnapshot();
+    expect(result.openOrders).toMatchObject([
+      { stopOrderType: "stop_loss_order", triggerPrice: "64463.8", status: "pending" },
+      { stopOrderType: "take_profit_order", triggerPrice: "62549.1", status: "pending" },
+      { stopOrderType: "new_conditional_type", triggerPrice: "63000", status: "pending" },
+      { stopOrderType: null, triggerPrice: null },
+      { stopOrderType: "stop_loss_order", triggerPrice: null },
+      { stopOrderType: null, triggerPrice: "62000" }
+    ]);
+  });
+  it.each(["invalid", "NaN", "-1", "0"])("rejects malformed or nonpositive trigger price %s", async (stop_price) => {
+    const client = new DeltaIndiaClient(config, async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/wallet/balances")) return balanceResponse();
+      if (path.endsWith("/positions/margined")) return Response.json({ result: [] });
+      return Response.json({ result: [{ id: 1, product_id: 27, side: "buy", size: "1",
+        stop_order_type: "stop_loss_order", stop_price }], meta: { after: null } });
+    });
+    await expect(client.getAccountSnapshot()).rejects.toThrow("trigger price");
+  });
   it("uses UTC microsecond bounds and sums signed PnL ledger entries in the USD wallet unit", async () => {
     const now = Date.UTC(2026, 10, 17, 18, 30);
     const requests: URL[] = [];

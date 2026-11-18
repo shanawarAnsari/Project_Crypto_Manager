@@ -37,6 +37,7 @@ export interface DeltaClientConfig {
 }
 
 export interface DeltaProductSpec {
+  maxLeverage: string;
   symbol: string;
   contractValue: string;
   tickSize: string;
@@ -65,6 +66,8 @@ export interface DeltaOpenOrderSnapshot {
   orderType: string;
   quantity: string;
   limitPrice: string | null;
+  stopOrderType: string | null;
+  triggerPrice: string | null;
   status: string;
   createdAt: string;
 }
@@ -166,12 +169,17 @@ export class DeltaIndiaClient {
     }
     const contractValue = String(item.contract_value ?? "");
     const tickSize = String(item.tick_size ?? "");
+    const initialMargin = decimalField(item.initial_margin, "product initial margin");
+    if (!initialMargin.isFinite() || initialMargin.lte(0) || initialMargin.gt(100)) {
+      throw new DeltaApiError("Exchange product initial margin is invalid", 502);
+    }
     for (const value of [contractValue, tickSize]) {
       if (!/^\d+(\.\d+)?$/.test(value) || new Decimal(value).lte(0)) {
         throw new DeltaApiError("Exchange product response was missing contract or tick size", 502);
       }
     }
     return {
+      maxLeverage: new Decimal(100).div(initialMargin).toString(),
       symbol: String(item.symbol ?? ""),
       contractValue,
       tickSize,
@@ -539,6 +547,10 @@ function normalizeAccountSnapshot(
       throw new DeltaApiError("Delta open-order response did not contain an order ID", 502);
     }
     const orderType = typeof item.order_type === "string" ? item.order_type : "unknown";
+    const triggerPrice = nullableDecimal(item.stop_price, "open-order trigger price");
+    if (triggerPrice !== null && new Decimal(triggerPrice).lte(0)) {
+      throw new DeltaApiError("Delta open-order trigger price must be positive", 502);
+    }
     return [{
       id: String(id),
       productId,
@@ -547,6 +559,8 @@ function normalizeAccountSnapshot(
       orderType,
       quantity: size.toString(),
       limitPrice: nullableDecimal(item.limit_price, "open-order limit price"),
+      stopOrderType: typeof item.stop_order_type === "string" && item.stop_order_type.trim() ? item.stop_order_type : null,
+      triggerPrice,
       status: typeof item.state === "string" ? item.state : "open",
       createdAt: typeof item.created_at === "string" ? item.created_at : ""
     }];

@@ -1,7 +1,7 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { AgentEvent, AgentSnapshot, Dashboard, Timeframe } from "../domain/types";
+import type { AgentEvent, AgentSnapshot, Dashboard, Order, Position, Timeframe } from "../domain/types";
 
 vi.mock("../api/live-stream", () => ({ connectLiveCandles: () => () => undefined }));
 
@@ -11,14 +11,17 @@ vi.mock("./MarketChart", () => ({
     loading,
     error,
     onTimeframeChange,
+    positions,
   }: {
     timeframe: Timeframe;
     loading: boolean;
     error: string | null;
     onTimeframeChange: (timeframe: Timeframe) => void;
+    positions: Position[];
   }) => (
     <div aria-label="Market chart">
       <span>Chart timeframe: {timeframe}</span>
+      <span data-testid="chart-position-count">{positions.length}</span>
       {loading && <span>Loading candles</span>}
       {error && <span role="alert">{error}</span>}
       <button onClick={() => onTimeframeChange("15m")}>15m chart test</button>
@@ -152,6 +155,172 @@ afterEach(() => {
 });
 
 describe("Agent Chat dashboard", () => {
+  it("opens loaded conversation history at the bottom with its scrollbar retained", async () => {
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(1200);
+    setupFetch();
+    render(<App />);
+    await screen.findByText(firstEvent.message);
+    expect(screen.getByRole("log").scrollTop).toBe(1200);
+    expect(screen.getByRole("log")).toHaveClass("overflow-y-auto", "max-h-[34rem]");
+  });
+  it("follows each new event and refreshed history after scrolling up without moving focus", async () => {
+    let height = 1200;
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(() => height);
+    const fetchMock = setupFetch();
+    render(<App />);
+    await screen.findByText(firstEvent.message);
+    const log = screen.getByRole("log");
+    const source = MockEventSource.instances[0]!;
+    act(() => source.open());
+    const input = screen.getByRole("textbox", { name: "Message the agent" });
+    input.focus();
+    let id = firstEvent.id;
+    for (const role of ["user", "assistant", "activity", "error"] as const) {
+      log.scrollTop = 20;
+      fireEvent.scroll(log);
+      height += 200;
+      const event: AgentEvent = { id: ++id, role, message: `Latest ${role} update`, createdAt: firstEvent.createdAt + id };
+      act(() => source.emit("activity", JSON.stringify(event)));
+      expect(screen.getByText(event.message)).toBeInTheDocument();
+      expect(log.scrollTop).toBe(height);
+      expect(input).toHaveFocus();
+    }
+    log.scrollTop = 0;
+    height = 2400;
+    const replacement: AgentEvent = { id: ++id, role: "assistant", message: "Latest refreshed history", createdAt: firstEvent.createdAt + id };
+    fetchMock.mockImplementation((input) => String(input) === "/api/agent"
+      ? jsonResponse({ ...agentSnapshot, events: [replacement] })
+      : jsonResponse(dashboard));
+    act(() => source.open());
+    await screen.findByText(replacement.message);
+    expect(log.scrollTop).toBe(height);
+  });
+  it("offers a separately confirmed Demo close-all while paused/locked without requiring the LLM", async () => {
+    let closed = false;
+    const fetchMock = setupFetch({ handler: (url) => {
+      if (url === "/api/dashboard") return jsonResponse({ ...dashboard, bot: { ...dashboard.bot, killSwitch: true } });
+      if (url === "/api/agent") return jsonResponse({ ...agentSnapshot, configured: false });
+      if (url.startsWith("/api/candles")) return jsonResponse({ candles: [] });
+      if (url === "/api/agent/close-all") { closed = true; return jsonResponse(agentSnapshot); }
+      return jsonResponse({ message: "unexpected" }, 404);
+    } });
+    render(<App />);
+    const close = await screen.findByRole("button", { name: "Close app-owned Demo BTCUSD trades" });
+    await waitFor(() => expect(close).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Preview Demo test (no order)" })).toBeDisabled();
+    fireEvent.click(close);
+    expect(closed).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm close app-owned Demo BTCUSD" }));
+    await screen.findByText(/App-owned Demo close request verified/);
+    expect(closed).toBe(true);
+    const call = fetchMock.mock.calls.find(([url]) => url === "/api/agent/close-all");
+    expect(JSON.parse(String(call?.[1]?.body))).toEqual({ confirmation: "CLOSE_OWNED_DEMO_BTCUSD" });
+  });
+  it("never enables the Demo close-all control for a Live account", async () => {
+    setupFetch({ dashboardResponse: { ...dashboard, environment: "production", accountEnvironment: "live" } });
+    render(<App />);
+    await screen.findByText(firstEvent.message);
+    expect(screen.getByRole("button", { name: "Close app-owned Demo BTCUSD trades" })).toBeDisabled();
+  });
+  it("accepts a verified owned-close response with automation still running", async () => {
+    setupFetch({ handler: (url) => {
+      if (url === "/api/dashboard") return jsonResponse({ ...dashboard, bot: { ...dashboard.bot, enabled: true } });
+      if (url === "/api/agent" || url === "/api/agent/close-all") return jsonResponse({ ...agentSnapshot, enabled: true, trade: null });
+      if (url.startsWith("/api/candles")) return jsonResponse({ candles: [] });
+      return jsonResponse({ message: "unexpected" }, 404);
+    } });
+    render(<App />);
+    const close = await screen.findByRole("button", { name: "Close app-owned Demo BTCUSD trades" });
+    await waitFor(() => expect(close).toBeEnabled());
+    fireEvent.click(close);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm close app-owned Demo BTCUSD" }));
+    expect(await screen.findByText(/App-owned Demo close request verified/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop bot" })).toBeEnabled();
+    expect(screen.queryByText(/Close-all response could not be verified/)).not.toBeInTheDocument();
+  });
+  it("distinguishes stop-loss and target orders with exact trigger prices and preserves exchange pending state", async () => {
+    const base: Order = { id: "stop", symbol: "BTCUSD", side: "buy", type: "market_order", quantity: "1",
+      stopOrderType: "stop_loss_order", triggerPrice: "64463.8", limitPrice: null, status: "pending",
+      createdAt: "2026-11-17T18:32:23Z" };
+    setupFetch({ dashboardResponse: { ...dashboard, orders: [
+      base, { ...base, id: "target", stopOrderType: "take_profit_order", triggerPrice: "62549.1" },
+      { ...base, id: "unknown", stopOrderType: "new_type", triggerPrice: "63000" },
+      { ...base, id: "missing", triggerPrice: null },
+      { ...base, id: "regular", stopOrderType: null, triggerPrice: null, type: "limit_order", limitPrice: "62000", status: "open" }
+    ] } });
+    render(<App />);
+    const target = await screen.findByText("Take profit / target");
+    const targetRow = within(target.closest("tr")!);
+    expect(targetRow.getByRole("cell", { name: "62,549.10" })).toBeInTheDocument();
+    expect(targetRow.getByText("Awaiting trigger")).toBeInTheDocument();
+    expect(targetRow.getByText("Exchange: pending")).toBeInTheDocument();
+    const stops = screen.getAllByText("Stop loss");
+    expect(within(stops[0]!.closest("tr")!).getByRole("cell", { name: "64,463.80" })).toBeInTheDocument();
+    expect(within(stops[1]!.closest("tr")!).getByRole("cell", { name: "Unavailable" })).toBeInTheDocument();
+    expect(screen.getByText("Conditional (unclassified)")).toBeInTheDocument();
+    expect(screen.getByText("new_type")).toBeInTheDocument();
+    const regular = within(screen.getByText("Order", { exact: true }).closest("tr")!);
+    expect(regular.getByRole("cell", { name: "Not applicable" })).toBeInTheDocument();
+    expect(regular.getByText("open", { exact: true })).toBeInTheDocument();
+  });
+  it("wires explicit test preview/confirmation and refreshes the position, stop, target and PnL", async () => {
+    let confirmed = false;
+    const position: Position = { id: "test", symbol: "BTCUSD", side: "long", quantity: "1",
+      entryPrice: "100000", markPrice: "100100", unrealizedPnl: "0.10", leverage: "1",
+      stopPrice: "99000", takeProfitPrice: "102000" };
+    const fetchMock = setupFetch({ handler: (url) => {
+      if (url === "/api/dashboard") return jsonResponse({ ...dashboard, bot: { ...dashboard.bot, enabled: true },
+        positions: confirmed ? [position] : [] });
+      if (url.startsWith("/api/candles")) return jsonResponse({ candles: [] });
+      if (url === "/api/agent") return jsonResponse({ ...agentSnapshot, enabled: true, trade: confirmed ? { status: "open" } : null });
+      if (url === "/api/agent/test-entry/preview") return jsonResponse({ token: "test-token", expiresAt: Date.now() + 30_000,
+        side: "buy", contracts: "1", leverage: 2, entryPrice: "100000", stopPrice: "99000", takeProfitPrice: "102000" });
+      if (url === "/api/agent/test-entry/confirm") {
+        confirmed = true;
+        return jsonResponse({ ...agentSnapshot, enabled: true, trade: { status: "open" } });
+      }
+      return jsonResponse({ message: "unexpected" }, 404);
+    } });
+    render(<App />);
+    const preview = await screen.findByRole("button", { name: "Preview Demo test (no order)" });
+    await waitFor(() => expect(preview).toBeEnabled());
+    fireEvent.change(screen.getByRole("combobox", { name: "Test leverage" }), { target: { value: "2" } });
+    fireEvent.click(preview);
+    const confirm = await screen.findByRole("button", { name: "Confirm Demo BUY test order" });
+    const previewRequest = fetchMock.mock.calls.find(([url]) => url === "/api/agent/test-entry/preview");
+    expect(JSON.parse(String(previewRequest?.[1]?.body))).toEqual({ side: "buy", leverage: 2 });
+    expect(fetchMock.mock.calls.some(([url]) => url === "/api/agent/test-entry/confirm")).toBe(false);
+    fireEvent.click(confirm);
+    await waitFor(() => expect(screen.getByTestId("chart-position-count")).toHaveTextContent("1"));
+    expect(screen.getByRole("columnheader", { name: "Target" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "$0.10" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "99,000.00" })).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "102,000.00" })).toBeInTheDocument();
+    const confirmation = fetchMock.mock.calls.find(([url]) => url === "/api/agent/test-entry/confirm");
+    expect(JSON.parse(String(confirmation?.[1]?.body))).toEqual({ token: "test-token", confirmation: "PLACE_DEMO_TEST_ORDER" });
+  });
+  it("polls account PnL every five seconds and hides stale positions when telemetry fails", async () => {
+    const interval = vi.spyOn(window, "setInterval");
+    let fail = false;
+    const position: Position = { id: "test", symbol: "BTCUSD", side: "long", quantity: "1",
+      entryPrice: "100000", markPrice: "100100", unrealizedPnl: "0.10", leverage: "1",
+      stopPrice: "99000", takeProfitPrice: "102000" };
+    setupFetch({ handler: (url) => {
+      if (url === "/api/dashboard") return fail ? jsonResponse({ message: "Account offline" }, 503)
+        : jsonResponse({ ...dashboard, positions: [position] });
+      if (url.startsWith("/api/candles")) return jsonResponse({ candles: [] });
+      if (url === "/api/agent") return jsonResponse(agentSnapshot);
+      return jsonResponse({ message: "unexpected" }, 404);
+    } });
+    render(<App />);
+    await waitFor(() => expect(screen.getByTestId("chart-position-count")).toHaveTextContent("1"));
+    const poll = interval.mock.calls.find(([, delay]) => delay === 5_000)?.[0];
+    expect(typeof poll).toBe("function");
+    fail = true;
+    await act(async () => { if (typeof poll === "function") await poll(); });
+    await waitFor(() => expect(screen.getByTestId("chart-position-count")).toHaveTextContent("0"));
+    expect(screen.queryByRole("cell", { name: "$0.10" })).not.toBeInTheDocument();
+  });
   it("distinguishes complete LLM proposals from system risk and execution updates", async () => {
     const proposal = [
       "Scheduled 5m review", "Action: OPEN", "Side: BUY", "Requested margin: 10% of USD equity",
@@ -180,11 +349,11 @@ describe("Agent Chat dashboard", () => {
     expect(await screen.findByText(firstEvent.message)).toBeInTheDocument();
     expect(screen.getByText("NVIDIA")).toBeInTheDocument();
     expect(screen.getByText("DEMO-ONLY")).toBeInTheDocument();
-    expect(screen.getByText("Maximum 25% of equity as margin")).toBeInTheDocument();
-    expect(screen.getByText("Maximum leverage: 2×")).toBeInTheDocument();
-    expect(screen.getByText("Planned stop plus fees ≤5% of allocation")).toBeInTheDocument();
+    expect(screen.getByText("Maximum 100% of equity as margin")).toBeInTheDocument();
+    expect(screen.getByText("Maximum leverage: 100×")).toBeInTheDocument();
+    expect(screen.getByText("Planned stop plus fees ≤30% of total USD equity")).toBeInTheDocument();
     expect(screen.getByText("Maximum 5 entries per UTC day")).toBeInTheDocument();
-    expect(screen.getByText("Daily loss limit: 10%")).toBeInTheDocument();
+    expect(screen.getByText("Daily loss limit: 50%")).toBeInTheDocument();
     expect(screen.getByText("Chart timeframe: 5m")).toBeInTheDocument();
     expect(screen.getAllByText("$12,000.00")).toHaveLength(2);
     expect(screen.getByRole("region", { name: "Account telemetry" }).querySelectorAll(".metric-card")).toHaveLength(8);

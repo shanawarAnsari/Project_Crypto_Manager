@@ -12,6 +12,8 @@ export interface StreamOptions {
   heartbeatMs?: number;
   socketFactory?: (url: string) => WebSocket;
   environment?: DeltaEnvironment;
+  symbols?: readonly string[];
+  timeframes?: readonly ChartTimeframe[];
 }
 
 export interface StreamTicker {
@@ -53,8 +55,8 @@ export class DeltaMarketStream extends EventEmitter {
         type: "subscribe",
         payload: {
           channels: [
-            { name: "v2/ticker", symbols: [STREAM_SYMBOL] },
-            ...CHART_TIMEFRAMES.map((timeframe) => ({ name: `candlestick_${timeframe}`, symbols: [STREAM_SYMBOL] }))
+            { name: "v2/ticker", symbols: this.options.symbols ?? [STREAM_SYMBOL] },
+            ...(this.options.timeframes ?? CHART_TIMEFRAMES).map((timeframe) => ({ name: `candlestick_${timeframe}`, symbols: this.options.symbols ?? [STREAM_SYMBOL] }))
           ]
         }
       }));
@@ -68,9 +70,9 @@ export class DeltaMarketStream extends EventEmitter {
     socket.on("message", (data) => {
       try {
         const message: unknown = JSON.parse(data.toString());
-        const ticker = parseTicker(message);
+        const ticker = parseTicker(message, this.options.symbols);
         if (ticker) this.emit("ticker", ticker);
-        const candle = parseStreamCandle(message);
+        const candle = parseStreamCandle(message, this.options.symbols);
         if (candle) this.emit("candle", candle);
         this.emit("message", message);
       } catch {
@@ -140,13 +142,14 @@ function positiveDecimal(value: unknown, allowZero = false): string | null {
  * Accepts the compact Delta India feed (`o/h/l/c/v/sy/res/ts`) and the legacy verbose
  * form (`open/high/low/close/volume/symbol/resolution/candle_start_time`). Timestamps are microseconds.
  */
-export function parseStreamCandle(message: unknown): StreamCandle | null {
+export function parseStreamCandle(message: unknown, symbols: readonly string[] = [STREAM_SYMBOL]): StreamCandle | null {
   if (typeof message !== "object" || message === null) return null;
   const raw = message as Record<string, unknown>;
   if (typeof raw.type !== "string" || !raw.type.startsWith("candlestick_")) return null;
   const timeframe = (raw.res ?? raw.resolution ?? raw.type.slice("candlestick_".length)) as ChartTimeframe;
   if (!CHART_TIMEFRAMES.includes(timeframe)) return null;
-  if ((raw.sy ?? raw.symbol) !== STREAM_SYMBOL) return null;
+  const symbol = raw.sy ?? raw.symbol;
+  if (typeof symbol !== "string" || !symbols.includes(symbol)) return null;
   const open = positiveDecimal(raw.o ?? raw.open);
   const high = positiveDecimal(raw.h ?? raw.high);
   const low = positiveDecimal(raw.l ?? raw.low);
@@ -168,18 +171,19 @@ export function parseStreamCandle(message: unknown): StreamCandle | null {
   }
   if (!Number.isSafeInteger(startMs) || startMs <= 0 || startMs % 60_000 !== 0) return null;
   return {
-    symbol: STREAM_SYMBOL,
+    symbol,
     timeframe,
     candle: { timestamp: startMs, open, high, low, close, volume }
   };
 }
 
-function parseTicker(message: unknown): StreamTicker | null {
+function parseTicker(message: unknown, symbols: readonly string[] = [STREAM_SYMBOL]): StreamTicker | null {
   if (typeof message !== "object" || message === null) return null;
   const envelope = message as Record<string, unknown>;
-  if (envelope.type !== "ticker" || typeof envelope.ticker !== "object" || envelope.ticker === null) return null;
-  const ticker = envelope.ticker as Record<string, unknown>;
-  if (ticker.symbol !== "BTCUSD") return null;
+  if (envelope.type !== "ticker" && envelope.type !== "v2/ticker") return null;
+  const ticker = typeof envelope.ticker === "object" && envelope.ticker !== null
+    ? envelope.ticker as Record<string, unknown> : envelope;
+  if (typeof ticker.symbol !== "string" || !symbols.includes(ticker.symbol)) return null;
   const rawPrice = ticker.mark_price ?? ticker.close;
   if (typeof rawPrice !== "string" && typeof rawPrice !== "number") return null;
   const price = new Decimal(String(rawPrice));
@@ -192,7 +196,7 @@ function parseTicker(message: unknown): StreamTicker | null {
     fundingRate = funding.toString();
   }
   return {
-    symbol: "BTCUSD",
+    symbol: ticker.symbol,
     markPrice: price.toString(),
     fundingRate,
     receivedAt: Date.now()

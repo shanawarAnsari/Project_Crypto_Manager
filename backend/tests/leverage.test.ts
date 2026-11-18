@@ -10,10 +10,27 @@ import { applyAiDecision } from "../src/ai/apply-decision.js";
 import { ExecutionService } from "../src/execution/execution-service.js";
 
 describe("maximum 2x leverage policy", () => {
+  it("preserves lower Demo caps and retains explicitly saved caps up to 100x across restarts", () => {
+    const folder = mkdtempSync(join(tmpdir(), "sunny-demo-cap-"));
+    const path = join(folder, "test.sqlite");
+    let db = createDatabase(path, 100);
+    try {
+      expect(new SqliteBotStateRepository(db).get().maxLeverage).toBe(2);
+      new SqliteBotStateRepository(db).update({ maxLeverage: 100 });
+      db.close();
+      db = createDatabase(path, 100);
+      expect(new SqliteBotStateRepository(db).get().maxLeverage).toBe(100);
+      db.close();
+      db = createDatabase(path);
+      expect(new SqliteBotStateRepository(db).get().maxLeverage).toBe(2);
+    } finally { db.close(); rmSync(folder, { recursive: true, force: true }); }
+  });
   it("defaults configuration to 2x, allows lower limits, and rejects higher limits", () => {
     expect(loadConfig({}).maxLeverage).toBe(2);
     expect(loadConfig({ MAX_LEVERAGE: "1.5" }).maxLeverage).toBe(1.5);
-    expect(() => loadConfig({ MAX_LEVERAGE: "2.01" })).toThrow();
+    expect(() => loadConfig({ DELTA_ENV: "production", MAX_LEVERAGE: "2.01" })).toThrow();
+    expect(loadConfig({ DELTA_ENV: "testnet", MAX_LEVERAGE: "100" }).maxLeverage).toBe(100);
+    expect(() => loadConfig({ DELTA_ENV: "testnet", MAX_LEVERAGE: "100.01" })).toThrow();
     expect(() => new RiskCore("100", 2.01)).toThrow("Leverage cap must be in (0, 2]");
   });
 

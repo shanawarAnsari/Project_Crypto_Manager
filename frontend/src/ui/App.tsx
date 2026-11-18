@@ -254,6 +254,19 @@ export default function App() {
     }
   }
 
+  async function closeAllDemoPositions() {
+    try {
+      const result = await api.closeAllDemoPositions();
+      if (!isAgentSnapshot(result) || result.trade !== null) {
+        throw new Error("Close-all response could not be verified. Inspect Delta Demo before any new action.");
+      }
+      setAgentSnapshot(result);
+      setAgentEvents((current) => mergeAgentEvents(current, result.events));
+    } finally {
+      await Promise.all([refreshAgent(), refreshDashboard()]);
+    }
+  }
+
   return (
     <main className="min-h-screen bg-terminal-base text-terminal-text">
       <header className="topbar">
@@ -477,7 +490,7 @@ export default function App() {
             <ActivityPanel
               audit={dashboard?.audit ?? []}
               positions={accountVerified ? dashboard.positions : []}
-              orders={dashboard?.orders ?? []}
+              orders={accountVerified ? dashboard.orders : []}
               tab={tab}
               trades={dashboard?.trades ?? []}
               onTabChange={setTab}
@@ -497,6 +510,9 @@ export default function App() {
                 dashboard.positions.length === 0 && dashboard.orders.length === 0)}
               onPreviewTestEntry={api.previewTestEntry}
               onConfirmTestEntry={confirmTestEntry}
+              canCloseAll={Boolean(dashboard?.environment === "testnet" &&
+                dashboard.accountEnvironment === "demo" && agentSnapshot)}
+              onCloseAll={closeAllDemoPositions}
               snapshot={agentSnapshot}
               streamStatus={agentStreamStatus}
             />
@@ -661,15 +677,26 @@ function ActivityPanel({
             {orders.length === 0 ? <EmptyState>No open orders.</EmptyState> : (
               <div className="table-scroll">
                 <table>
-                  <thead><tr><th>Market</th><th>Side</th><th>Type</th><th>Qty</th><th>Limit</th><th>Status</th><th>Placed</th></tr></thead>
+                  <thead><tr><th>Market</th><th>Side</th><th>Purpose</th><th>Type</th><th>Qty</th><th>Trigger price</th><th>Limit</th><th>Status</th><th>Placed</th></tr></thead>
                   <tbody>
-                    {orders.map((order) => (
+                    {orders.map((order) => {
+                      const purpose = order.stopOrderType === "stop_loss_order" ? "Stop loss"
+                        : order.stopOrderType === "take_profit_order" ? "Take profit / target"
+                          : order.stopOrderType || order.triggerPrice ? "Conditional (unclassified)" : "Order";
+                      const conditional = Boolean(order.stopOrderType || order.triggerPrice);
+                      return (
                       <tr key={order.id}>
-                        <td className="font-semibold">{order.symbol}</td><td>{order.side.toUpperCase()}</td><td>{order.type}</td>
-                        <td>{order.quantity}</td><td>{order.limitPrice ? formatNumber(order.limitPrice) : "Market"}</td>
-                        <td><StatusPill tone="amber">{order.status}</StatusPill></td><td>{formatTime(order.createdAt)}</td>
+                        <td className="font-semibold">{order.symbol}</td><td>{order.side.toUpperCase()}</td>
+                        <td><span className={purpose === "Stop loss" ? "text-terminal-amber" : purpose === "Take profit / target" ? "text-terminal-green" : ""}>{purpose}</span>
+                          {order.stopOrderType && purpose === "Conditional (unclassified)" && <div className="text-terminal-muted">{order.stopOrderType}</div>}</td>
+                        <td>{order.type}</td><td>{order.quantity}</td>
+                        <td>{order.triggerPrice ? formatNumber(order.triggerPrice) : conditional ? "Unavailable" : "Not applicable"}</td>
+                        <td>{order.limitPrice ? formatNumber(order.limitPrice) : order.type === "market_order" ? "Market" : "Unavailable"}</td>
+                        <td><StatusPill tone="amber">{conditional && order.status === "pending" ? "Awaiting trigger" : order.status}</StatusPill>
+                          {conditional && order.status === "pending" && <div className="text-terminal-muted">Exchange: pending</div>}</td>
+                        <td>{formatTime(order.createdAt)}</td>
                       </tr>
-                    ))}
+                    ); })}
                   </tbody>
                 </table>
               </div>

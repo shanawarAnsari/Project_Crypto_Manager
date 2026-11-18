@@ -1,5 +1,16 @@
 # Execution
 
+Latest Demo revision allows <=100x but execution independently enforces lower configuration/saved
+limits and the verified product cap (100 / initial_margin). Gateway leverage-setting acknowledgement
+is required before entry. Production/legacy retain the 2x ceiling; existing positions are not modified.
+
+The Demo-panel manual close uses the owned-exit path, never `emergencyHalt` or blanket cancellation.
+Only authenticated app-owned BTCUSD trades may close; external/manual exposure is excluded.
+A fresh `manual-owned-close` risk intent permits reduce-only exits while paused/locked, without
+enabling entries. Signed size/product checks still apply. Verified success preserves automation
+controls/scheduling; uncertain ownership/fill/residual orders pause and lock at the agent boundary.
+The emergency kill-switch cancellation/close behavior below is unchanged.
+
 The Demo chat agent also has `closeAgentPosition`: a separate fresh, one-use risk approval is required.
 The gateway rechecks the exact signed position size and submits an idempotent reduce-only market order.
 The agent performs authenticated client-order and account read-back; unknown/partial exits are not
@@ -11,4 +22,7 @@ All entry order submission is confined to `ExecutionService` and its Delta India
 
 Emergency cancellation/close requests require a separate one-use risk approval after the local kill switch is latched. Cancellation explicitly includes limit, stop, and reduce-only order classes. Position closes use reduce-only market orders scoped to the approved product, rather than Delta's account-wide close-all endpoint. The execution service reads active orders and positions back from the exchange; it returns success only when the requested product has no remaining exposure. A failed read-back is unconfirmed, not successful.
 
-Entry leverage cannot exceed the minimum of the current persisted limit, environment configuration, and the 2x system ceiling. The gateway independently rejects leverage above 2x. Lower leverage remains allowed; no startup migration changes existing exchange positions.
+Entry leverage cannot exceed the minimum of the current persisted limit, environment configuration,
+verified exchange product limit and environment ceiling (100x Demo, 2x Live). The gateway independently
+enforces product/environment caps. Lower leverage remains allowed; no migration raises saved caps
+or changes existing exchange positions.

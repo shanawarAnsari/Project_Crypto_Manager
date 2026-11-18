@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import type { AgentEvent, AgentSnapshot, AgentTimeframe, DemoTestEntryPreview } from "../domain/types";
 import { Panel, StatusPill } from "./Status";
 import { DemoTestEntry } from "./DemoTestEntry";
@@ -19,6 +19,8 @@ export function AgentChat({
   canTestEntry,
   onPreviewTestEntry,
   onConfirmTestEntry,
+  canCloseAll,
+  onCloseAll,
 }: {
   snapshot: AgentSnapshot | null;
   events: AgentEvent[];
@@ -29,16 +31,24 @@ export function AgentChat({
   onSend: (message: string) => Promise<void>;
   onSaveSettings: (timeframe: AgentTimeframe) => Promise<void>;
   canTestEntry: boolean;
-  onPreviewTestEntry: (side: "buy" | "sell") => Promise<DemoTestEntryPreview>;
+  onPreviewTestEntry: (side: "buy" | "sell", leverage: number) => Promise<DemoTestEntryPreview>;
   onConfirmTestEntry: (token: string) => Promise<void>;
+  canCloseAll: boolean;
+  onCloseAll: () => Promise<void>;
 }) {
   const [message, setMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const conversationRef = useRef<HTMLDivElement>(null);
   const demoOnlyBlocked = accountEnvironment === "live";
   const unavailable = snapshot?.configured === false;
+
+  useLayoutEffect(() => {
+    const conversation = conversationRef.current;
+    if (conversation) conversation.scrollTop = conversation.scrollHeight;
+  }, [events]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -134,6 +144,7 @@ export function AgentChat({
             aria-relevant="additions"
             className="min-h-72 max-h-[34rem] space-y-3 overflow-y-auto rounded border border-terminal-border bg-[#0b1016] p-3"
             role="log"
+            ref={conversationRef}
           >
             {events.length > 0 ? events.map((item) => <ChatEvent event={item} key={item.id} />) : (
               <p className="py-12 text-center text-xs text-terminal-muted">
@@ -156,18 +167,22 @@ export function AgentChat({
         <div className="rounded border border-terminal-border bg-slate-900/40 p-3">
           <h3 className="text-[9px] font-bold uppercase tracking-wider text-terminal-muted">Execution policy</h3>
           <ul className="mt-2 grid gap-1 text-[11px] text-slate-300 sm:grid-cols-2">
-            <li>Maximum 25% of equity as margin</li>
-            <li>Maximum leverage: 2×</li>
-            <li>Planned stop plus fees ≤5% of allocation</li>
+            <li>Maximum 100% of equity as margin</li>
+            <li>Maximum leverage: 100×</li>
+            <li>Planned stop plus fees ≤30% of total USD equity</li>
             <li>Maximum 5 entries per UTC day</li>
-            <li>Daily loss limit: 10%</li>
+            <li>Daily loss limit: 50%</li>
           </ul>
+          <p className="mt-2 text-[11px] text-amber-200">Demo policy ceiling only: lower saved/configured/exchange
+            limits and the absolute daily-loss cap still apply. High leverage can cause liquidation before
+            stops execute; these limits do not guarantee maximum realized losses.</p>
         </div>
         <p className="text-[10px] leading-relaxed text-terminal-muted">
           Chat messages inform future decisions only; they cannot enable automation or place trades. Decision notes show concise rationales and observable steps, not private reasoning.
         </p>
 
-        <DemoTestEntry enabled={canTestEntry} onPreview={onPreviewTestEntry} onConfirm={onConfirmTestEntry} />
+        <DemoTestEntry enabled={canTestEntry} onPreview={onPreviewTestEntry} onConfirm={onConfirmTestEntry}
+          closeAllControl={{ enabled: canCloseAll, onCloseAll }} />
 
         <form className="space-y-2" onSubmit={(event) => void submit(event)}>
           <label className="field-label" htmlFor="agent-message">

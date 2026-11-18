@@ -1,5 +1,6 @@
 import Decimal from "decimal.js";
 import type { BotState } from "./domain.js";
+import { DEMO_DAILY_LOSS_PERCENT, leverageCeiling } from "./domain.js";
 import { loadConfig } from "./config.js";
 import type { AppConfig } from "./config.js";
 import type Database from "better-sqlite3";
@@ -30,7 +31,7 @@ export interface AppServices {
 
 export function createServices(): AppServices {
   const config = loadConfig();
-  const db = createDatabase(config.databasePath);
+  const db = createDatabase(config.databasePath, leverageCeiling(config.deltaEnvironment));
   const botState = new SqliteBotStateRepository(db);
   const candles = new SqliteCandleRepository(db);
   const trades = new SqliteTradeRepository(db);
@@ -42,7 +43,7 @@ export function createServices(): AppServices {
     productId: config.deltaProductId,
     environment: config.deltaEnvironment
   });
-  const risk = new RiskCore(config.maxDailyLoss, config.maxLeverage);
+  const risk = new RiskCore(config.maxDailyLoss, config.maxLeverage, config.deltaEnvironment);
   const orderGateway = new DeltaIndiaOrderGateway({
     apiKey: config.deltaApiKey,
     apiSecret: config.deltaApiSecret,
@@ -66,14 +67,14 @@ export function testnetExecutionConfigured(services: Pick<AppServices, "config">
 
 export { testnetExecutionConfigured as executionConfigured };
 
-// The USD wallet balance already excludes unrealized PnL. Demo policy is 10%; Live keeps its configured policy.
+// The USD wallet balance already excludes unrealized PnL; Live keeps its configured policy.
 export function syncDailyLossCap(
   services: Pick<AppServices, "config" | "botState">,
   account: { equity: string; realizedPnl: string; unrealizedPnl: string }
 ): BotState {
   const startCapital = new Decimal(account.equity).minus(account.realizedPnl);
   const cap = Decimal.min(
-    startCapital.mul(services.config.deltaEnvironment === "testnet" ? "10" : services.config.dailyLossPercent).div(100),
+    startCapital.mul(services.config.deltaEnvironment === "testnet" ? DEMO_DAILY_LOSS_PERCENT : services.config.dailyLossPercent).div(100),
     services.config.maxDailyLoss
   ).toDecimalPlaces(8, Decimal.ROUND_DOWN);
   if (!cap.isFinite()) throw new Error("Daily loss cap could not be derived from account capital");

@@ -3,7 +3,7 @@ import Decimal from "decimal.js";
 import { deltaEndpointsByEnvironment, type DeltaClientConfig, type DeltaProductSpec } from "../exchange/delta-client.js";
 import { createDeltaSignature } from "../exchange/signing.js";
 import type { Side } from "../domain.js";
-import { MAX_LEVERAGE } from "../domain.js";
+import { leverageCeiling } from "../domain.js";
 import type { AgentCloseApproval, EmergencyCloseApproval, RiskApproval } from "../domain.js";
 import { hasConsumedAgentCloseApproval, hasConsumedEmergencyCloseApproval, hasConsumedRiskApproval } from "../risk-core/risk-core.js";
 
@@ -73,6 +73,10 @@ export class DeltaIndiaOrderGateway implements OrderGateway {
     if (this.resolveProduct) {
       const spec = await this.resolveProduct();
       if (!spec.live || spec.symbol !== "BTCUSD") throw new Error("Delta order product is not the live BTCUSD contract");
+      const exchangeMax = new Decimal(spec.maxLeverage);
+      if (!exchangeMax.isFinite() || exchangeMax.lt(1) || leverage.gt(exchangeMax)) {
+        throw new Error("Delta order leverage exceeds verified exchange product cap");
+      }
       const contractValue = new Decimal(spec.contractValue);
       const tickSize = new Decimal(spec.tickSize);
       // Approvals are sized in base units; Delta orders are sized in whole contracts.
@@ -84,7 +88,8 @@ export class DeltaIndiaOrderGateway implements OrderGateway {
     if (!size.isFinite() || !size.gt(0) || !size.isInteger() || size.gt(Number.MAX_SAFE_INTEGER)) {
       throw new Error("Delta order size must be a positive whole contract quantity");
     }
-    if (!leverage.isFinite() || !leverage.gt(0) || leverage.gt(MAX_LEVERAGE)) {
+    if (!leverage.isFinite() || !leverage.gt(0) || leverage.gt(leverageCeiling(this.config.environment ?? "testnet")) ||
+        (!this.resolveProduct && leverage.gt(2))) {
       throw new Error("Delta order leverage exceeds the hard maximum");
     }
     if (!stopPrice.isFinite() || !stopPrice.gt(0) ||
@@ -111,8 +116,9 @@ export class DeltaIndiaOrderGateway implements OrderGateway {
   }
 
   async closeAgentPosition(approval: AgentCloseApproval): Promise<unknown> {
+    const canClose = () => approval.intent === "manual-owned-close" || this.canEnter();
     if (!hasConsumedAgentCloseApproval(approval) || this.config.environment !== "testnet" ||
-        approval.productId !== this.config.productId || !this.canEnter()) {
+        approval.productId !== this.config.productId || !canClose()) {
       throw new Error("Agent close requires a matching Demo risk approval and enabled automation");
     }
     await this.assertConfiguredProduct(approval.productId);
@@ -120,7 +126,7 @@ export class DeltaIndiaOrderGateway implements OrderGateway {
     if (positions.length !== 1) throw new Error("Owned position could not be verified before closing");
     const size = new Decimal(String(positions[0]!.size));
     if (!size.abs().eq(approval.contracts) || (size.gt(0) ? "sell" : "buy") !== approval.side ||
-        !this.canEnter()) throw new Error("Position changed before close submission");
+        !canClose()) throw new Error("Position changed before close submission");
     return this.request("/v2/orders", "POST", {
       product_id: approval.productId, size: size.abs().toNumber(), side: approval.side,
       order_type: "market_order", reduce_only: "true",

@@ -1,7 +1,7 @@
 import express, { type ErrorRequestHandler, type Express } from "express";
 import { z } from "zod";
 import {
-  CHART_TIMEFRAMES, TIMEFRAMES, MAX_LEVERAGE, type ChartTimeframe, type StrategyName, type Timeframe, type TradingSignal
+  CHART_TIMEFRAMES, TIMEFRAMES, MAX_LEVERAGE, DEMO_MAX_LEVERAGE, type ChartTimeframe, type StrategyName, type Timeframe, type TradingSignal
 } from "./domain.js";
 import type { AppServices } from "./services.js";
 import { testnetExecutionConfigured, syncDailyLossCap } from "./services.js";
@@ -71,6 +71,8 @@ interface DashboardOrder {
   type: string;
   quantity: string;
   limitPrice: string | null;
+  stopOrderType: string | null;
+  triggerPrice: string | null;
   status: string;
   createdAt: string;
 }
@@ -166,10 +168,10 @@ export function createApp(services: AppServices, agent?: TradingAgent): Express 
     response.json(agent.setTimeframe(parsed.data.timeframe));
   });
   app.post("/api/agent/test-entry/preview", async (request, response) => {
-    const parsed = z.object({ side: z.enum(["buy", "sell"]) }).strict().safeParse(request.body);
-    if (!parsed.success) { response.status(400).json({ message: "Test entry requires a buy or sell side" }); return; }
+    const parsed = z.object({ side: z.enum(["buy", "sell"]), leverage: z.number().int().min(1).max(DEMO_MAX_LEVERAGE).default(1) }).strict().safeParse(request.body);
+    if (!parsed.success) { response.status(400).json({ message: "Test entry requires a buy or sell side and whole leverage from 1 to 100" }); return; }
     if (!agent) { response.status(503).json({ message: "Trading agent is unavailable" }); return; }
-    try { response.json(await agent.previewTestEntry(parsed.data.side)); }
+    try { response.json(await agent.previewTestEntry(parsed.data.side, parsed.data.leverage)); }
     catch (error) { response.status(409).json({ message: error instanceof Error ? error.message : "Test preview unavailable" }); }
   });
   app.post("/api/agent/test-entry/confirm", async (request, response) => {
@@ -178,6 +180,14 @@ export function createApp(services: AppServices, agent?: TradingAgent): Express 
     if (!agent) { response.status(503).json({ message: "Trading agent is unavailable" }); return; }
     try { await agent.confirmTestEntry(parsed.data.token); response.json(agent.snapshot()); }
     catch (error) { response.status(409).json({ message: error instanceof Error ? error.message : "Test entry unavailable" }); }
+  });
+  app.post("/api/agent/close-all", async (request, response) => {
+    const parsed = z.object({ confirmation: z.literal("CLOSE_OWNED_DEMO_BTCUSD") }).strict().safeParse(request.body);
+    if (!parsed.success) { response.status(400).json({ message: "Explicit CLOSE_OWNED_DEMO_BTCUSD confirmation is required" }); return; }
+    if (!agent) { response.status(503).json({ message: "Trading agent is unavailable" }); return; }
+    if (services.config.deltaEnvironment !== "testnet") { response.status(409).json({ message: "Close all positions is Demo-only" }); return; }
+    try { await agent.closeAllDemoPositions(); response.json(agent.snapshot()); }
+    catch (error) { response.status(409).json({ message: error instanceof Error ? error.message : "Demo close-all failed; inspect exchange exposure" }); }
   });
   app.get("/api/agent/events", (request, response) => {
     if (!agent) { response.status(503).json({ message: "Trading agent is unavailable" }); return; }
@@ -291,6 +301,8 @@ export function createApp(services: AppServices, agent?: TradingAgent): Express 
           type: order.orderType,
           quantity: order.quantity,
           limitPrice: order.limitPrice,
+          stopOrderType: order.stopOrderType,
+          triggerPrice: order.triggerPrice,
           status: order.status,
           createdAt: order.createdAt
         }));
@@ -483,6 +495,10 @@ export function createApp(services: AppServices, agent?: TradingAgent): Express 
     }
     const current = services.botState.get();
     const enabled = parsed.data.enabled ?? !current.enabled;
+    if (enabled && agent?.safetyActionInProgress) {
+      response.status(409).json({ message: "Wait for the Demo close-all safety action before enabling automation" });
+      return;
+    }
     if (enabled && agent && (services.config.deltaEnvironment !== "testnet" || !agent.snapshot().configured)) {
       response.status(409).json({ message: "Start requires the Demo environment and configured NVIDIA API credentials" });
       return;
@@ -539,6 +555,10 @@ export function createApp(services: AppServices, agent?: TradingAgent): Express 
       return;
     }
     const active = parsed.data.active ?? true;
+    if (agent?.safetyActionInProgress) {
+      response.status(409).json({ message: "Demo close-all is in progress; the risk lock cannot be changed and duplicate safety actions are refused" });
+      return;
+    }
     agent?.invalidate();
     const bot = services.botState.update({ killSwitch: active, ...(active ? { enabled: false } : {}) });
     agent?.repository.event("activity", active ? "Operator engaged the kill switch." : "Operator manually cleared the risk lock.");

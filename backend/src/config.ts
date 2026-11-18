@@ -1,7 +1,7 @@
 import "dotenv/config";
 import Decimal from "decimal.js";
 import { z } from "zod";
-import { MAX_LEVERAGE } from "./domain.js";
+import { MAX_LEVERAGE, DEMO_MAX_LEVERAGE, leverageCeiling } from "./domain.js";
 
 const EnvironmentSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(4000),
@@ -16,7 +16,7 @@ const EnvironmentSchema = z.object({
     (value) => value === "" || value === undefined ? undefined : value,
     z.coerce.number().int().positive().optional()
   ),
-  MAX_LEVERAGE: z.coerce.number().positive().max(MAX_LEVERAGE).default(MAX_LEVERAGE),
+  MAX_LEVERAGE: z.coerce.number().positive().max(DEMO_MAX_LEVERAGE).default(MAX_LEVERAGE),
   MAX_DAILY_LOSS: z.string().default("1000"),
   DAILY_LOSS_PERCENT: z.string().default("2"),
   DELTA_ENV: z.enum(["production", "testnet"]).default("testnet"),
@@ -45,6 +45,9 @@ export type AppConfig = Readonly<{
 
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = EnvironmentSchema.parse(source);
+  if (parsed.MAX_LEVERAGE > leverageCeiling(parsed.DELTA_ENV)) {
+    throw new Error("MAX_LEVERAGE exceeds the selected environment ceiling");
+  }
   const hasEnvironmentSpecificCredentials = Boolean(
     parsed.DELTA_DEMO_API_KEY || parsed.DELTA_DEMO_API_SECRET ||
     parsed.DELTA_LIVE_API_KEY || parsed.DELTA_LIVE_API_SECRET

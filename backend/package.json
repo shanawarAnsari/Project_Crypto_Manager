@@ -2,13 +2,14 @@
   "name": "@sunny/backend",
   "version": "0.1.0",
   "private": true,
-  "description": "Risk-first Sunny Crypto Manager backend",
+  "description": "Crypto Manager liquidity-sweep desk backend for Delta Exchange India",
   "engines": {
     "node": ">=24 <25"
   },
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "node dist/src/server.js",
+    "dev": "tsx watch src/desk-server.ts",
+    "dev:legacy": "tsx watch src/server.ts",
+    "start": "node dist/src/desk-server.js",
     "build": "tsc -p tsconfig.json",
     "lint": "eslint src tests",
     "typecheck": "tsc --noEmit -p tsconfig.json",

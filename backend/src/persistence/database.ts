@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { CHART_TIMEFRAMES, MAX_LEVERAGE } from "../domain.js";
+import { CHART_TIMEFRAMES, MAX_LEVERAGE, DEMO_MAX_LEVERAGE } from "../domain.js";
 
 const CANDLE_TIMEFRAME_CHECK = CHART_TIMEFRAMES.map((timeframe) => `'${timeframe}'`).join(", ");
 const CANDLES_TABLE_SQL = `CREATE TABLE IF NOT EXISTS candles (
@@ -16,7 +16,10 @@ const CANDLES_TABLE_SQL = `CREATE TABLE IF NOT EXISTS candles (
       PRIMARY KEY (symbol, timeframe, timestamp)
     )`;
 
-export function createDatabase(path: string): Database.Database {
+export function createDatabase(path: string, leverageCap = MAX_LEVERAGE): Database.Database {
+  if (!Number.isFinite(leverageCap) || leverageCap <= 0 || leverageCap > DEMO_MAX_LEVERAGE) {
+    throw new Error("Invalid database leverage ceiling");
+  }
   const filename = path === ":memory:" ? path : resolve(path);
   if (filename !== ":memory:") mkdirSync(dirname(filename), { recursive: true });
   const db = new Database(filename);
@@ -136,7 +139,7 @@ export function createDatabase(path: string): Database.Database {
     })();
   }
   db.prepare(`UPDATE bot_state SET max_leverage = ?, enabled = 0, updated_at = unixepoch() * 1000
-    WHERE max_leverage > ?`).run(MAX_LEVERAGE, MAX_LEVERAGE);
+    WHERE max_leverage > ?`).run(leverageCap, leverageCap);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_candles_timeframe_timestamp
     ON candles(symbol, timeframe, timestamp DESC)`);
   return db;

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import Decimal from "decimal.js";
+import { DEMO_MAX_MARGIN_PERCENT, DEMO_MAX_LEVERAGE } from "../domain.js";
 
 export const AGENT_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h"] as const;
 export type AgentTimeframe = typeof AGENT_TIMEFRAMES[number];
@@ -13,8 +14,8 @@ export const AgentDecisionSchema = z.discriminatedUnion("action", [
     action: z.literal("open"), side: z.enum(["buy", "sell"]),
     stopPrice: price, takeProfitPrice: price,
     marginPercent: z.string().regex(/^(0|[1-9]\d*)(\.\d+)?$/).max(20)
-      .refine((value) => new Decimal(value).gt(0) && new Decimal(value).lte(25)),
-    leverage: z.number().min(1).max(2), summary
+      .refine((value) => new Decimal(value).gt(0) && new Decimal(value).lte(DEMO_MAX_MARGIN_PERCENT)),
+    leverage: z.number().min(1).max(DEMO_MAX_LEVERAGE), summary
   }).strict()
 ]);
 export type AgentDecision = z.infer<typeof AgentDecisionSchema>;
