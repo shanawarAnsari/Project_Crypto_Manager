@@ -1,720 +1,350 @@
-/** Desk orchestrator: owns all services and runs the 7-agent pipeline on every 5M candle close. */
 import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
 import { DeltaMarketStream, type StreamCandle, type StreamTicker } from "../exchange/market-stream.js";
-import { Analyst, OpenAiCompatibleModel } from "./analyst.js";
-import { buildDailyReview, createAgents, newContext, PIPELINE_ORDER, type Agent, type CycleContext, type DeskServices } from "./agents.js";
+import { PIPELINE_ORDER } from "./agents.js";
+import { evaluateCandidate, strategies } from "./catalog.js";
+import { bracketPrices, budgetedLossPerContract } from "./candidate-policy.js";
 import type { DeskConfig } from "./config.js";
 import { DeskDatabase } from "./db.js";
-import { DeltaBridge, type DeltaFill, type DeltaHealth, type DeltaPosition, type OrderResult } from "./delta-bridge.js";
-import { DemoFeed } from "./demo-feed.js";
-import { roundTo, sessionInfo, specFor } from "./market.js";
-import { PaperEngine, round2, type PositionEvent } from "./paper-engine.js";
-import { DEFAULT_RULES, mergeRules, newGuardianState, type GuardianState, type RiskRules } from "./risk.js";
-import { DEFAULT_PARAMS, mapLiquidity, mergeParams, type StrategyParams } from "./strategy.js";
-import type { Bar, CycleSummary, DataSource, ExecutionVenue, Position, Toast } from "./types.js";
+import { DeltaBridge, type DeltaPosition, type DeltaFill } from "./delta-bridge.js";
+import { FIVE_MIN, roundTo, sessionFor, sessionInfo, specFor } from "./market.js";
+import { DEFAULT_RULES, mergeRules, newGuardianState, validateRules, type RiskRules } from "./risk.js";
+import { DEFAULT_PARAMS, mergeParams, validateParams, type StrategyParams } from "./strategy.js";
+import type { Bar, CycleSummary, Toast } from "./types.js";
 
-/** Broadcasts `{type, data, ts}` frames to every connected WebSocket client. */
+const now = () => Date.now() / 1000;
+const day = () => new Date().toISOString().slice(0, 10);
+const fresh = (t: number | null, seconds = 15) => t !== null && now() >= t && now() - t <= seconds;
+const latestClosed = () => (Math.floor(now() / FIVE_MIN) - 1) * FIVE_MIN;
+const message = (err: unknown) => err instanceof Error ? err.message : "Delta unavailable";
+
 export class EventHub {
   readonly clients = new Set<WebSocket>();
   sent = 0;
   emit(type: string, data: unknown): void {
-    const frame = JSON.stringify({ type, data, ts: Date.now() / 1000 });
-    for (const ws of this.clients) {
-      if (ws.readyState === 1) {
-        ws.send(frame);
-        this.sent += 1;
-      }
-    }
+    const frame = JSON.stringify({ type, data, ts: now() });
+    for (const ws of this.clients) if (ws.readyState === 1) { ws.send(frame); this.sent++; }
   }
 }
 
-/** Desk-owned Delta position state used for break-even, partial and trailing management. */
-export interface ManagedPosition {
-  id: string;
-  signal_id: string;
-  symbol: string;
-  direction: "LONG" | "SHORT";
-  entry: number;
-  initial_stop: number;
-  stop: number;
-  tp1: number;
-  tp2: number;
-  contracts: number;
-  initial_contracts: number;
-  realized: number;
-  tp1_hit: boolean;
-  breakeven: boolean;
-  opened_at: number;
-  last_mark: number;
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-export class Desk implements DeskServices {
-  params: StrategyParams;
-  rules: RiskRules;
-  readonly guardian: GuardianState = newGuardianState();
-  readonly analyst: Analyst;
-  readonly paper: PaperEngine;
+export class Desk {
+  readonly dataSource = "delta";
+  readonly analyst = { mode: "catalog", modelName: "Deterministic catalog" };
   readonly db: DeskDatabase;
   readonly delta: DeltaBridge;
-  readonly feed: DemoFeed;
-  readonly agents: Agent[] = createAgents();
-  dataSource: DataSource = "demo";
-  execution: ExecutionVenue = "paper";
-  paused = false;
-  scenarioUntil = 0;
-  banner: string | null = null;
-  cycles = 0;
-  tradesTaken = 0;
+  readonly guardian = newGuardianState();
   readonly lastCycle: Record<string, CycleSummary> = {};
-  private readonly liveBars: Record<string, Bar[]> = {};
-  private readonly deltaEquityCurve: Array<{ time: number; equity: number }> = [];
-  private readonly spreads: Record<string, number> = {};
-  private readonly lastSeenBar: Record<string, number> = {};
-  private readonly formingBars: Record<string, Bar> = {};
   readonly quotes: Record<string, { mark: number; updated_at: number }> = {};
   private readonly stream: DeltaMarketStream;
-  private historyNeedsRefresh = false;
-  accountUpdatedAt: number | null = null;
-  accountError: string | null = null;
-  deltaPositions: DeltaPosition[] = [];
-  deltaWallet: { balance: number; available: number; asset: string } | null = null;
-  deltaFills: DeltaFill[] = [];
-  private fillsFetchedAt = 0;
-  managed: Record<string, ManagedPosition>;
-  private running = false;
+  private readonly history: Record<string, Bar[]> = {};
+  private readonly forming: Record<string, Bar> = {};
+  private readonly seen: Record<string, number> = {};
+  private readonly curve: { time: number; equity: number }[] = [];
   private readonly timers: NodeJS.Timeout[] = [];
-  private deltaWasOk: boolean | null = null;
-  private managing = false;
+  private running = false;
+  private polling = false;
+  private generation = 0;
+  private permit: (() => boolean) | null = null;
+  private syncing: Promise<void> | null = null;
+  private workingOrders: boolean | null = null;
+  private selected: string | null = null;
+  private armed = false;
+  private armedAt = 0;
+  private suspended = false;
+  get execution(): "disabled" | "delta" { return this.armed ? "delta" : "disabled"; }
+  get strategyId(): string | null { return this.selected; }
+  get paused(): boolean { return this.suspended; }
+  set paused(value: boolean) { if (value) this.disarm(); this.suspended = value; }
+  banner: string | null = null;
+  cycles = 0;
+  deltaPositions: DeltaPosition[] = [];
+  deltaFills: DeltaFill[] = [];
+  fillsError: string | null = "Awaiting Delta demo fills";
+  fillsUpdatedAt: number | null = null;
+  deltaWallet: Awaited<ReturnType<DeltaBridge["wallet"]>> | null = null;
+  accountUpdatedAt: number | null = null;
+  accountError: string | null = "Awaiting Delta demo account";
+  rules: RiskRules;
+  params: StrategyParams;
 
-  constructor(readonly cfg: DeskConfig, readonly hub: EventHub, deps: { fetcher?: typeof fetch; db?: DeskDatabase; feed?: DemoFeed; stream?: DeltaMarketStream } = {}) {
+  constructor(readonly cfg: DeskConfig, readonly hub: EventHub, deps: { fetcher?: typeof fetch; db?: DeskDatabase; stream?: DeltaMarketStream } = {}) {
     this.db = deps.db ?? new DeskDatabase(cfg.databasePath);
-    this.rules = mergeRules({ ...DEFAULT_RULES, allowed_sessions: [...DEFAULT_RULES.allowed_sessions], news_hours_utc: [] }, this.db.kvGet("rules", {}));
-    this.rules.leverage = Math.min(this.rules.leverage, cfg.maxLeverage);
+    this.rules = mergeRules({ ...DEFAULT_RULES, leverage: Math.min(DEFAULT_RULES.leverage, cfg.maxLeverage) }, this.db.kvGet("rules", {}));
     this.params = mergeParams({ ...DEFAULT_PARAMS }, this.db.kvGet("params", {}));
-    this.managed = this.db.kvGet("managed", {});
-    this.paper = new PaperEngine(cfg.startingBalance);
-    this.feed = deps.feed ?? new DemoFeed(cfg.instruments);
-    for (const s of cfg.instruments) specFor(s);
-    const model = cfg.analystApiKey ? new OpenAiCompatibleModel(cfg.analystApiKey, cfg.analystBaseUrl, cfg.analystModel, cfg.analystTimeoutMs) : null;
-    this.analyst = new Analyst(model, cfg.analystModel);
-    this.execution = cfg.execution;
-    this.delta = new DeltaBridge(
-      { apiKey: cfg.deltaApiKey, apiSecret: cfg.deltaApiSecret, environment: cfg.deltaEnvironment, liveTradingConfirmed: cfg.liveTradingConfirmed },
-      (row) => {
-        this.db.logExec(row);
-        this.hub.emit("delta_log", row);
-      },
-      deps.fetcher ?? fetch
-    );
-    this.dataSource = cfg.demoMode ? "demo" : "delta";
-    this.stream = deps.stream ?? new DeltaMarketStream({ environment: cfg.deltaEnvironment, symbols: cfg.instruments, timeframes: ["5m"] });
-    this.stream.on("candle", (update: StreamCandle) => {
-      if (this.dataSource !== "delta" || update.timeframe !== "5m") return;
-      const c = update.candle;
-      const bar: Bar = { time: c.timestamp / 1000, open: Number(c.open), high: Number(c.high), low: Number(c.low), close: Number(c.close), volume: Number(c.volume) };
-      const closed = this.liveBars[update.symbol]?.at(-1)?.time ?? 0;
-      if (bar.time <= closed || bar.time < (this.formingBars[update.symbol]?.time ?? 0)) return;
-      this.formingBars[update.symbol] = bar;
-      this.broadcastMarket({ [update.symbol]: bar });
+    this.guardian.kill_switch = this.db.kvGet("kill", false);
+    this.delta = new DeltaBridge({
+      apiKey: cfg.deltaApiKey, apiSecret: cfg.deltaApiSecret, environment: cfg.deltaEnvironment,
+      maySubmit: () => this.permit?.() === true
+    }, row => { this.db.logExec(row); this.hub.emit("delta_log", row); }, deps.fetcher);
+    this.stream = deps.stream ?? new DeltaMarketStream({ environment: "testnet", symbols: cfg.instruments, timeframes: ["5m"] });
+    this.stream.on("streamError", () => { /* REST remains authoritative for strategy bars and quotes. */ });
+    this.stream.on("candle", (u: StreamCandle) => {
+      if (!cfg.instruments.includes(u.symbol) || u.timeframe !== "5m") return;
+      const c = u.candle;
+      const b = { time: c.timestamp / 1000, open: Number(c.open), high: Number(c.high), low: Number(c.low), close: Number(c.close), volume: Number(c.volume) };
+      if (!Object.values(b).every(Number.isFinite) || b.time <= (this.history[u.symbol]?.at(-1)?.time ?? 0) || b.time < (this.forming[u.symbol]?.time ?? 0)) return;
+      this.forming[u.symbol] = b;
+      this.market({ [u.symbol]: b });
     });
-    this.stream.on("ticker", (tick: StreamTicker) => {
-      if (this.dataSource !== "delta") return;
-      this.quotes[tick.symbol] = { mark: Number(tick.markPrice), updated_at: tick.receivedAt / 1000 };
-      this.broadcastMarket({});
-    });
-    this.stream.on("streamError", (message: string) => {
-      process.stderr.write(`${message}; REST polling remains active.\n`);
-    });
-    this.stream.on("connected", () => { this.historyNeedsRefresh = true; });
-  }
-
-  // ---------------------------------------------------------------- DeskServices
-  clock(): number {
-    return this.dataSource === "demo" ? this.feed.clock() : Math.floor(Date.now() / 1000);
-  }
-
-  bars(instrument: string, n: number): Bar[] {
-    return this.dataSource === "demo" ? this.feed.candles(instrument, n) : (this.liveBars[instrument] ?? []).slice(-n);
-  }
-
-  chartBars(instrument: string, n: number): Bar[] {
-    const closed = this.bars(instrument, n);
-    const forming = this.dataSource === "delta" ? this.formingBars[instrument] : undefined;
-    return forming && forming.time > (closed.at(-1)?.time ?? 0) ? [...closed, forming].slice(-n) : closed;
-  }
-
-  async spreadPct(instrument: string): Promise<number> {
-    if (this.dataSource === "demo") return this.feed.spreadPct(instrument);
-    return this.spreads[instrument] ?? 0;
-  }
-
-  equity(): number {
-    if (this.execution === "delta") {
-      return this.deltaWallet ? round2(this.deltaWallet.balance + this.deltaPositions.reduce((s, p) => s + p.unrealizedPnl, 0)) : 0;
-    }
-    return this.paper.equity();
-  }
-
-  balance(): number {
-    return this.execution === "delta" ? round2(this.deltaWallet?.balance ?? 0) : round2(this.paper.balance);
-  }
-
-  availableMargin(): number {
-    if (this.execution === "delta") return this.deltaWallet?.available ?? 0;
-    return Math.max(0, this.paper.equity() - this.paper.usedMargin(this.rules.leverage));
-  }
-
-  openTradeCount(): number {
-    return this.execution === "delta" ? this.deltaPositions.length : this.paper.positions.size;
-  }
-
-  hasPosition(instrument: string): boolean {
-    return this.execution === "delta" ? this.deltaPositions.some((p) => p.symbol === instrument) : this.paper.openPositions(instrument).length > 0;
-  }
-
-  lastPrice(instrument: string): number {
-    return this.bars(instrument, 1).at(-1)?.close ?? 0;
-  }
-
-  toast(t: Toast): void {
-    this.hub.emit("toast", t);
-  }
-
-  async sendDeltaOrder(ctx: CycleContext): Promise<OrderResult> {
-    if (this.accountError || !this.accountUpdatedAt || Date.now() / 1000 - this.accountUpdatedAt > 15) {
-      return { ok: false, message: "Delta account data is unavailable or stale; order refused.", symbol: ctx.instrument };
-    }
-    const quote = this.quotes[ctx.instrument];
-    if (this.dataSource !== "delta" || !quote || Date.now() / 1000 - quote.updated_at > 15) {
-      return { ok: false, message: "Delta market data is unavailable or stale; order refused.", symbol: ctx.instrument };
-    }
-    const setup = ctx.setup!;
-    const plan = ctx.decision!.trade_plan;
-    if (!this.db.claimSignal(setup.signal_id, { symbol: ctx.instrument, direction: setup.direction, contracts: ctx.contracts, plan })) {
-      return { ok: false, duplicate: true, message: "Signal already executed once (idempotency guard).", symbol: ctx.instrument };
-    }
-    const res = await this.delta.placeEntry({
-      signalId: setup.signal_id, symbol: ctx.instrument, direction: setup.direction, contracts: ctx.contracts,
-      stop: plan.stop_loss, target: plan.take_profit_2, leverage: this.rules.leverage
-    });
-    this.db.finishSignal(setup.signal_id, res.ok ? "filled" : "failed", res.message, res.orderId != null ? String(res.orderId) : null, res.price ?? null);
-    if (res.ok) {
-      const entry = res.price ?? plan.entry_price;
-      this.managed[ctx.instrument] = {
-        id: res.clientOrderId ?? randomUUID(), signal_id: setup.signal_id, symbol: ctx.instrument, direction: setup.direction, entry,
-        initial_stop: plan.stop_loss, stop: plan.stop_loss, tp1: plan.take_profit_1, tp2: plan.take_profit_2,
-        contracts: res.contracts ?? ctx.contracts, initial_contracts: res.contracts ?? ctx.contracts, realized: 0,
-        tp1_hit: false, breakeven: false, opened_at: Date.now() / 1000, last_mark: entry
-      };
-      this.db.kvSet("managed", this.managed);
-      void this.syncDelta();
-    }
-    return res;
-  }
-
-  onTradePlaced(ctx: CycleContext, venue: ExecutionVenue, price: number, contracts: number): void {
-    this.tradesTaken += 1;
-    const setup = ctx.setup!;
-    this.hub.emit("trade_placed", { venue, price, volume: contracts, instrument: ctx.instrument, direction: setup.direction, signal_id: setup.signal_id, first: this.tradesTaken === 1 });
-    this.toast({ level: "success", title: venue === "delta" ? `Trade placed on Delta India (${this.delta.accountLabel()})` : "Paper trade opened", message: `${setup.direction} ${contracts} contracts ${ctx.instrument} @ ${price}` });
-  }
-
-  // ---------------------------------------------------------------- views
-  modeLabel(): string {
-    if (this.execution === "delta") return this.delta.accountLabel() === "DEMO" ? "DELTA DEMO" : "DELTA LIVE";
-    return this.dataSource === "delta" ? "PAPER" : "DEMO";
-  }
-
-  kpis(): Record<string, unknown> {
-    const eq = this.equity();
-    const start = this.guardian.day_start_equity || eq;
-    const trades = this.db.trades(500, this.execution);
-    const wins = trades.filter((t) => (t.pnl || 0) > 0).length;
-    const openRisk = this.execution === "paper" ? this.paper.openRisk() : this.deltaOpenRisk();
-    return {
-      equity: eq, balance: this.balance(), today_pnl: round2(eq - start), today_pnl_pct: start ? Math.round((eq - start) / start * 100_000) / 1000 : 0,
-      win_rate: trades.length ? Math.round(wins / trades.length * 1000) / 10 : 0, trades: trades.length,
-      open_risk: openRisk, open_risk_pct: openRisk === null || !eq ? null : round2(openRisk / eq * 100),
-      drawdown_pct: start ? Math.round(Math.max(0, (start - eq) / start * 100) * 1000) / 1000 : 0,
-      dd_limit_pct: this.rules.daily_drawdown_kill_pct, kill_switch: this.guardian.kill_switch
-    };
-  }
-
-  private deltaOpenRisk(): number | null {
-    if (!this.deltaWallet || this.accountError || !this.accountUpdatedAt || Date.now() / 1000 - this.accountUpdatedAt > 15) return null;
-    let total = 0;
-    for (const position of this.deltaPositions) {
-      const managed = this.managed[position.symbol];
-      if (!managed || managed.direction !== position.direction || !Number.isFinite(managed.stop) || managed.stop <= 0) return null;
-      const loss = position.direction === "LONG" ? position.entryPrice - managed.stop : managed.stop - position.entryPrice;
-      total += Math.max(0, loss) * position.contracts * specFor(position.symbol).contractValue;
-    }
-    return round2(total);
-  }
-
-  positions(venue: ExecutionVenue = this.execution): Position[] {
-    if (venue !== "delta") return this.paper.openPositions();
-    return this.deltaPositions.map((p) => {
-      const m = this.managed[p.symbol];
-      return {
-        id: m?.id ?? `${p.symbol}-manual`, signal_id: m?.signal_id ?? "manual", instrument: p.symbol, direction: p.direction,
-        volume: p.contracts, initial_volume: m?.initial_contracts ?? p.contracts, entry_price: p.entryPrice, stop_loss: m?.stop ?? 0,
-        initial_stop: m?.initial_stop ?? 0, take_profit_1: m?.tp1 ?? 0, take_profit_2: m?.tp2 ?? 0, opened_at: m?.opened_at ?? 0,
-        status: "open", closed_at: null, exit_price: null, realized_pnl: m?.realized ?? 0, unrealized_pnl: round2(p.unrealizedPnl),
-        tp1_hit: m?.tp1_hit ?? false, breakeven: m?.breakeven ?? false, venue: "delta", close_reason: m ? null : "Not managed by the desk"
-      };
+    this.stream.on("ticker", (u: StreamTicker) => {
+      const mark = Number(u.markPrice);
+      if (!cfg.instruments.includes(u.symbol) || !Number.isFinite(mark) || mark <= 0) return;
+      this.quotes[u.symbol] = { mark, updated_at: u.receivedAt / 1000 };
+      this.market({});
     });
   }
 
-  snapshot(): Record<string, unknown> {
-    return {
-      mode: this.modeLabel(), data_source: this.dataSource, execution: this.execution, banner: this.banner,
-      analyst_mode: this.analyst.mode, model: this.analyst.modelName, instruments: this.cfg.instruments, pipeline: PIPELINE_ORDER,
-      kpis: this.kpis(), positions: this.positions(),
-      equity_curve: (this.execution === "delta" ? this.deltaEquityCurve : this.paper.equityCurve).slice(-600), last_cycle: this.lastCycle,
-      session: sessionInfo(this.clock()), rules: this.rules, params: this.params, delta: this.delta.lastHealth,
-      delta_env: this.cfg.deltaEnvironment, max_leverage: this.cfg.maxLeverage, kill_switch: this.guardian.kill_switch, paused: this.paused,
-      specs: Object.fromEntries(this.cfg.instruments.map((s) => [s, specFor(s)])),
-      account: this.accountSnapshot(), quotes: this.quotes
-    };
+  modeLabel(): string { return this.armed ? "DELTA DEMO · ARMED" : "DELTA DEMO · OBSERVE"; }
+  toast(t: Toast) { this.hub.emit("toast", t); }
+  bars(symbol: string, n: number) { return (this.history[symbol] ?? []).slice(-n); }
+  chartBars(symbol: string, n: number) {
+    const bars = this.bars(symbol, n), b = this.forming[symbol];
+    return b && b.time > (bars.at(-1)?.time ?? 0) ? [...bars, b].slice(-n) : bars;
   }
-
-  accountSnapshot(): Record<string, unknown> {
-    const wallet = this.deltaWallet;
-    return {
-      environment: this.cfg.deltaEnvironment, wallet,
-      equity: wallet ? round2(wallet.balance + this.deltaPositions.reduce((sum, p) => sum + p.unrealizedPnl, 0)) : null,
-      positions: this.positions("delta"), fills: this.deltaFills, updated_at: this.accountUpdatedAt, error: this.accountError
-    };
+  private equity() { return this.deltaWallet ? this.deltaWallet.balance + this.deltaPositions.reduce((s,p) => s + p.unrealizedPnl, 0) : null; }
+  positions() {
+    return this.deltaPositions.map(p => ({
+      id: String(p.productId), instrument: p.symbol, direction: p.direction, volume: p.contracts, entry_price: p.entryPrice,
+      unrealized_pnl: p.unrealizedPnl, mark_price: p.markPrice, status: "open", venue: "delta",
+      stop_loss: null, take_profit_1: null, take_profit_2: null, opened_at: null, realized_pnl: null
+    }));
   }
-
-  private recordDeltaEquityPoint(time: number): { time: number; equity: number } | undefined {
-    if (!this.deltaWallet || this.accountError) return undefined;
-    const point = { time, equity: this.equity() };
-    const last = this.deltaEquityCurve.at(-1);
-    if (last && point.time <= last.time) return undefined;
-    this.deltaEquityCurve.push(point);
-    if (this.deltaEquityCurve.length > 600) this.deltaEquityCurve.splice(0, this.deltaEquityCurve.length - 600);
-    return point;
+  accountSnapshot() {
+    return { environment: "testnet", wallet: this.deltaWallet, equity: this.equity(), positions: this.positions(), fills: this.deltaFills,
+      updated_at: this.accountUpdatedAt, error: this.accountError, working_orders: this.workingOrders,
+      fills_error: this.fillsError, fills_updated_at: this.fillsUpdatedAt };
   }
-
-  // ---------------------------------------------------------------- lifecycle
-  async start(): Promise<void> {
-    this.running = true;
+  kpis() {
+    const eq = this.equity(), start = this.guardian.day_key === day() ? this.guardian.day_start_equity : 0;
+    const valid = eq !== null && !this.accountError && fresh(this.accountUpdatedAt);
+    const diff = valid && start > 0 ? eq - start : null;
+    const openRisk = valid && !this.workingOrders && this.deltaPositions.length === 0 ? 0 : null;
+    return { equity: valid ? eq : null, balance: valid ? this.deltaWallet?.balance : null, today_pnl: diff,
+      today_pnl_pct: diff !== null ? diff / start * 100 : null, drawdown_pct: diff !== null ? Math.max(0, -diff / start * 100) : null,
+      win_rate: null, trades: null, open_risk: openRisk, open_risk_pct: openRisk, dd_limit_pct: this.rules.daily_drawdown_kill_pct,
+      kill_switch: this.guardian.kill_switch };
+  }
+  snapshot() {
+    return { mode: this.modeLabel(), data_source: this.dataSource, execution: this.execution, strategy_id: this.strategyId,
+      execution_permitted: this.cfg.execution === "delta", banner: this.banner, analyst_mode: this.analyst.mode, model: this.analyst.modelName,
+      instruments: this.cfg.instruments, pipeline: PIPELINE_ORDER, kpis: this.kpis(), positions: this.positions(), equity_curve: this.curve.slice(),
+      last_cycle: this.lastCycle, session: sessionInfo(now()), rules: this.rules, params: this.params, delta: this.delta.lastHealth, delta_env: "testnet",
+      max_leverage: this.cfg.maxLeverage, kill_switch: this.guardian.kill_switch, paused: this.paused,
+      specs: Object.fromEntries(Object.keys(this.delta.lastHealth.products).map(s => [s,specFor(s)])),
+      account: this.accountSnapshot(), quotes: this.quotes };
+  }
+  private market(candles: Record<string, Bar>) {
+    this.hub.emit("market", { candles, kpis: this.kpis(), positions: this.positions(), session: sessionInfo(now()),
+      mode: this.modeLabel(), account: this.accountSnapshot(), quotes: this.quotes, banner: this.banner });
+  }
+  private disarm() {
+    this.generation++;
+    this.permit = null;
+    this.armed = false;
+    this.hub.emit("mode", { mode: this.modeLabel(), execution: this.execution, data_source: "delta", strategy_id: this.strategyId });
+  }
+  selectStrategy(id: string) {
+    if (!strategies.some(s => s.id === id)) return { ok: false, message: "Unknown catalog strategy" };
+    this.selected = id;
+    this.disarm();
+    return { ok: true, message: "Strategy selected; execution disabled until armed." };
+  }
+  private accountBlock(requireFlat = true): string | null {
+    if (this.accountError || !fresh(this.accountUpdatedAt) || !this.deltaWallet) return "Fresh authenticated account data required";
+    if (!(this.deltaWallet.available > 0 && this.deltaWallet.balance > 0)) return "Positive demo balance and available margin required";
+    const drawdown = this.kpis().drawdown_pct;
+    if (drawdown === null || drawdown >= this.rules.daily_drawdown_kill_pct || this.db.kvGet(`dd-lock:${day()}`,false)) return "Session drawdown baseline unavailable or limit reached";
+    if (requireFlat && (this.workingOrders !== false || this.deltaPositions.length)) return "Account must have no positions or working orders";
+    return null;
+  }
+  private environmentBlock(requireFlat = true): string | null {
+    if (this.cfg.execution !== "delta") return "Set DESK_EXECUTION=delta to permit demo execution";
+    if (!this.selected) return "Select a catalog strategy first";
+    if (this.paused || this.guardian.kill_switch) return "Desk paused or kill switch engaged";
+    if (!this.delta.isReady()) return "Fresh healthy authenticated Delta demo connection required";
+    if (validateRules(this.rules, this.cfg.maxLeverage).length) return "Invalid risk configuration";
+    return this.accountBlock(requireFlat);
+  }
+  async setMode(b: { execution?: string; data_source?: string }) {
+    this.disarm();
+    if ((b.data_source && b.data_source !== "delta") || !["disabled","delta"].includes(b.execution ?? "")) return { ok: false, message: "Choose disabled or delta; synthetic data is unavailable" };
+    if (b.execution === "disabled") return { ok: true, message: "Execution disabled" };
+    if (this.cfg.execution !== "delta" || !this.selected || this.guardian.kill_switch || this.paused || this.db.hasUnresolvedOrder()) {
+      return { ok: false, message: "Select a strategy, enable demo execution and resolve any risk or unknown-order lock first." };
+    }
+    const generation = this.generation;
     await this.refreshHealth();
-    if (!this.cfg.demoMode) {
-      try {
-        await this.loadLiveHistory();
-      } catch (err) {
-        this.banner = `Delta India market data unavailable: ${err instanceof Error ? err.message : String(err)}. Retrying; no synthetic data substituted.`;
-      }
-      this.stream.connect();
-    }
     await this.syncDelta();
-    this.resetDay(true);
-    void this.cycleLoop();
-    this.timers.push(setInterval(() => void this.refreshHealth().catch((err: unknown) => {
-      process.stderr.write(`Delta health error: ${String(err)}\n`);
-    }), 15_000));
-    this.timers.push(setInterval(() => void this.syncDelta(), 3_000));
+    const block = this.environmentBlock();
+    if (generation !== this.generation || block) return { ok: false, message: block ?? "Arming interrupted" };
+    this.armed = true;
+    this.armedAt = now();
+    this.hub.emit("mode", { mode: this.modeLabel(), execution: this.execution, data_source: "delta", strategy_id: this.selected });
+    return { ok: true, message: "Autonomous demo scanning armed; at most one position will be open at a time." };
   }
-
-  async stop(): Promise<void> {
-    this.running = false;
-    this.stream.close();
-    for (const t of this.timers) clearInterval(t);
+  updateSettings(rules: RiskRules, params: StrategyParams) {
+    const errors = [...validateRules(rules, this.cfg.maxLeverage), ...validateParams(params, rules.min_rr)];
+    if (errors.length) throw new Error(errors.join("; "));
+    this.disarm(); this.rules = rules; this.params = params;
+    this.db.kvSet("rules", rules); this.db.kvSet("params", params);
+    this.hub.emit("settings", { rules, params });
   }
-
-  private resetDay(force = false): void {
-    const key = new Date(this.clock() * 1000).toISOString().slice(0, 10);
-    if (force || key !== this.guardian.day_key) {
-      const prev = this.guardian.day_key;
-      this.guardian.day_key = key;
-      this.guardian.day_start_equity = this.equity();
-      if (prev && !force) void this.writeReview(prev);
-    }
+  async engageKillSwitch(engaged: boolean, closeAll: boolean) {
+    this.disarm();
+    this.guardian.kill_switch = engaged;
+    this.db.kvSet("kill", engaged); this.hub.emit("kill_switch", { engaged, closed: [] });
+    return { ok: !closeAll, engaged, closed: [], message: closeAll ? "Switch applied; close positions directly on Delta demo." : "Execution disarmed" };
   }
-
-  async writeReview(day: string): Promise<string> {
-    const since = Date.now() / 1000 - 86_400;
-    const text = await buildDailyReview(this.db.decisionsSince(since), this.db.tradesSince(since), this.analyst.chat);
-    this.db.saveReview(day, text);
-    this.hub.emit("review", { day, text });
-    return text;
-  }
-
-  // ---------------------------------------------------------------- pipeline
-  async runPipeline(instrument: string, paceMs = 0): Promise<CycleContext> {
-    const ctx = newContext(instrument, randomUUID().slice(0, 8));
-    this.hub.emit("cycle_start", { instrument, cycle_id: ctx.cycleId });
-    for (const agent of this.agents) {
-      if (ctx.halted && agent.name !== "Chronicler") continue;
-      if (agent.name === "Chronicler" && !ctx.setup) break;
-      const res = await agent.run(ctx, this);
-      this.hub.emit("agent", { instrument, cycle_id: ctx.cycleId, ...res });
-      if (paceMs && ctx.setup && agent.name !== "Chronicler") await sleep(paceMs);
-    }
-    const summary: CycleSummary = {
-      instrument, cycle_id: ctx.cycleId, outcome: ctx.outcome, ts: Date.now() / 1000, setup: ctx.setup, decision: ctx.decision,
-      checks: ctx.checks, levels: ctx.levels, trace: ctx.trace, execution: ctx.execution
-    };
-    const prev = this.lastCycle[instrument];
-    if (ctx.setup || !prev) this.lastCycle[instrument] = summary;
-    else prev.levels = summary.levels; // keep the last interesting setup but refresh levels
-    this.hub.emit("cycle_end", summary);
-    if (ctx.outcome === "vetoed") {
-      const veto = ctx.trace.find((r) => r.status === "veto");
-      this.toast({ level: "warning", title: `AEGIS veto · ${instrument}`, message: (veto?.summary ?? "Vetoed").slice(0, 180) });
-    }
-    return ctx;
-  }
-
-  private handlePaperEvents(instrument: string, events: PositionEvent[]): void {
-    for (const ev of events) {
-      if (ev.type === "sl" || ev.type === "stop" || ev.type === "tp2") this.db.recordTrade(ev.position);
-      this.hub.emit("position_event", { instrument, ...ev });
-      const title = { tp1: "TP1 hit · 50% closed", tp2: "TP2 hit · trade closed", be: "Stop moved to break-even", sl: "Stop loss hit", stop: ev.reason ?? "Stopped", manual: "Closed manually" }[ev.type];
-      const level = ev.type === "tp1" || ev.type === "tp2" ? "success" : ev.type === "be" || ev.type === "stop" ? "info" : "error";
-      this.toast({ level, title, message: `${ev.position.instrument} ${ev.position.direction} · realized $${ev.position.realized_pnl.toFixed(2)}` });
-    }
-  }
-
-  private broadcastMarket(candles: Record<string, Bar>): void {
-    const equityPoint = this.execution === "paper" ? { time: this.clock(), equity: this.equity() } : undefined;
-    this.hub.emit("market", {
-      candles, kpis: this.kpis(), positions: this.positions(), ...(equityPoint ? { equity_point: equityPoint } : {}),
-      session: sessionInfo(this.clock()), mode: this.modeLabel(),
-      account: this.accountSnapshot(), quotes: this.quotes, banner: this.banner
-    });
-  }
-
-  private async cycleLoop(): Promise<void> {
-    while (this.running) {
-      try {
-        if (this.paused) {
-          await sleep(500);
-          continue;
-        }
-        const scenario = Date.now() < this.scenarioUntil;
-        if (this.dataSource === "demo") {
-          const fresh = this.feed.advance();
-          this.resetDay();
-          for (const [inst, candle] of Object.entries(fresh)) this.handlePaperEvents(inst, this.paper.onCandle(inst, candle));
-          this.broadcastMarket(fresh);
-          for (const inst of this.cfg.instruments) await this.runPipeline(inst, 350);
-          this.cycles += 1;
-          await sleep(scenario ? 900 : this.cfg.demoCycleSeconds * 1000);
-        } else {
-          await this.deltaCycle();
-          await sleep(5_000);
-        }
-      } catch (err) {
-        process.stderr.write(`cycle loop error: ${err instanceof Error ? err.stack : String(err)}\n`);
-        this.toast({ level: "error", title: "Cycle error", message: "An internal error occurred; the desk will retry automatically." });
-        await sleep(3_000);
-      }
-    }
-  }
-
-  async loadLiveHistory(): Promise<void> {
-    for (const inst of this.cfg.instruments) {
-      await this.delta.loadProduct(inst);
-      const bars = await this.delta.candles5m(inst, 2000);
-      if (bars.length < 100) throw new Error(`Not enough Delta history for ${inst}`);
-      this.liveBars[inst] = bars;
-      // Treat the latest closed bar as unseen so the pipeline runs immediately after switching to live data.
-      this.lastSeenBar[inst] ??= bars.at(-2)!.time;
-      const ticker = await this.delta.ticker(inst);
-      this.spreads[inst] = ticker.spreadPct;
-      this.quotes[inst] = { mark: ticker.mark, updated_at: Date.now() / 1000 };
-    }
-    this.historyNeedsRefresh = false;
-  }
-
-  private async deltaCycle(): Promise<void> {
-    const fresh: Record<string, Bar> = {};
-    for (const inst of this.cfg.instruments) {
-      try {
-        if (this.historyNeedsRefresh || !this.liveBars[inst]?.length) await this.loadLiveHistory();
-        const latest = await this.delta.candles5m(inst, 6);
-        const t = await this.delta.ticker(inst);
-        this.spreads[inst] = t.spreadPct;
-        this.quotes[inst] = { mark: t.mark, updated_at: Date.now() / 1000 };
-        const series = this.liveBars[inst] ?? [];
-        for (const bar of latest) {
-          const idx = series.findIndex((b) => b.time === bar.time);
-          if (idx >= 0) series[idx] = bar;
-          else if (!series.length || bar.time > series.at(-1)!.time) series.push(bar);
-        }
-        if (series.length > 3000) series.splice(0, series.length - 2500);
-        this.liveBars[inst] = series;
-        if (this.formingBars[inst] && this.formingBars[inst].time <= (series.at(-1)?.time ?? 0)) delete this.formingBars[inst];
-        const last = series.at(-1);
-        if (last && last.time > (this.lastSeenBar[inst] ?? 0)) {
-          this.lastSeenBar[inst] = last.time;
-          fresh[inst] = last;
-        }
-      } catch (err) {
-        this.banner = `Delta data delayed for ${inst}: ${err instanceof Error ? err.message : String(err)}. Retrying; last received values may be stale.`;
-      }
-    }
-    if (this.cfg.instruments.every((inst) => Date.now() / 1000 - (this.quotes[inst]?.updated_at ?? 0) < 15)) this.banner = null;
-    this.resetDay();
-    for (const [inst, candle] of Object.entries(fresh)) {
-      if (this.execution === "paper") this.handlePaperEvents(inst, this.paper.onCandle(inst, candle));
-    }
-    const chart: Record<string, Bar> = {};
-    for (const inst of this.cfg.instruments) {
-      const last = this.chartBars(inst, 1).at(-1);
-      if (last) chart[inst] = last;
-    }
-    this.broadcastMarket(chart);
-    if (Object.keys(fresh).length) {
-      for (const inst of Object.keys(fresh)) await this.runPipeline(inst, 0);
-      this.cycles += 1;
-    }
-  }
-
-  // ---------------------------------------------------------------- Delta health / sync / management
-  async refreshHealth(): Promise<DeltaHealth> {
+  async closeDelta(_symbol: string) { return { ok: false, message: "Close directly on Delta demo. Desk does not modify existing positions." }; }
+  async refreshHealth() {
     const h = await this.delta.health(this.cfg.instruments);
-    const ok = h.connected && h.issues.length === 0;
-    if (this.deltaWasOk !== null && ok !== this.deltaWasOk) {
-      if (ok) this.toast({ level: "success", title: "Delta India ready", message: `Connected to the ${this.delta.accountLabel()} account.` });
-      else if (h.issues[0]) this.toast({ level: "error", title: "Delta check failed", message: h.issues[0].fix });
-    }
-    this.deltaWasOk = ok;
+    if (this.armed && !this.delta.isReady()) this.disarm();
     this.hub.emit("delta_status", { ...h, mode: this.modeLabel() });
     return h;
   }
-
-  async syncDelta(): Promise<void> {
-    if (this.managing) return;
-    if (!this.delta.hasCredentials) {
-      this.accountError = "No complete credentials configured for the selected Delta account.";
-      this.hub.emit("delta_sync", { account: this.accountSnapshot() });
-      return;
-    }
-    this.managing = true;
+  async syncDelta() {
+    this.syncing ??= this.readAccount().finally(() => { this.syncing = null; });
+    return this.syncing;
+  }
+  private async readAccount() {
+    const t = now();
     try {
-      const [wallet, positions] = await Promise.all([this.delta.wallet(), this.delta.positions()]);
-      this.deltaWallet = wallet;
-      this.deltaPositions = positions;
-      if (Date.now() - this.fillsFetchedAt > 15_000) {
-        // Fill history is informational: a failure here must not mark wallet/positions stale.
-        this.fillsFetchedAt = Date.now();
-        this.deltaFills = await this.delta.fills(30).catch(() => this.deltaFills);
+      if (!this.delta.hasCredentials) throw new Error("Demo credentials not configured");
+      const [wallet, positions, orders] = await Promise.all([this.delta.wallet(), this.delta.positions(), this.delta.hasWorkingOrders()]);
+      if (!fresh(t)) throw new Error("Account response is stale");
+      this.deltaWallet = wallet; this.deltaPositions = positions; this.workingOrders = orders;
+      this.accountUpdatedAt = t; this.accountError = null;
+      const eq = this.equity()!;
+      if (eq > 0 && this.guardian.day_key !== day()) {
+        this.guardian.day_key = day();
+        const key = `day-start:${day()}`;
+        this.guardian.day_start_equity = this.db.kvGet(key, eq);
+        this.db.kvSet(key, this.guardian.day_start_equity);
       }
-      this.accountUpdatedAt = Date.now() / 1000;
-      this.accountError = null;
-      const equityPoint = this.execution === "delta" ? this.recordDeltaEquityPoint(this.accountUpdatedAt) : undefined;
-      if (this.execution === "delta" && this.delta.isReady()) await this.managePositions();
-      this.hub.emit("delta_sync", {
-        positions: this.positions(), account: this.accountSnapshot(), ...(equityPoint ? { equity_point: equityPoint } : {})
-      });
-    } catch (err) {
-      this.accountError = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`Delta account sync failed: ${this.accountError}\n`);
+      const point = { time: t, equity: eq };
+      if ((this.kpis().drawdown_pct ?? 0) >= this.rules.daily_drawdown_kill_pct) this.db.kvSet(`dd-lock:${day()}`,true);
+      this.curve.push(point); if (this.curve.length > 600) this.curve.shift();
+      this.hub.emit("delta_sync", { account: this.accountSnapshot(), positions: this.positions(), equity_point: point });
+      if (this.armed && this.accountBlock(false)) this.disarm();
+    } catch (e) {
+      this.accountError = message(e);
+      if (this.armed) this.disarm();
       this.hub.emit("delta_sync", { account: this.accountSnapshot() });
-    } finally {
-      this.managing = false;
     }
   }
-
-  /** Break-even at 1R, 50% partial at TP1 and a trailing stop toward TP2 on the exchange position. */
-  private async managePositions(): Promise<void> {
-    let changed = false;
-    for (const m of Object.values(this.managed)) {
-      const pos = this.deltaPositions.find((p) => p.symbol === m.symbol);
-      const cv = specFor(m.symbol).contractValue;
-      const sign = m.direction === "LONG" ? 1 : -1;
-      if (!pos) {
-        // Closed on the exchange (bracket stop/target or manual). Estimate the exit from the last mark.
-        const mark = m.last_mark;
-        const stopHit = sign * (mark - m.stop) <= 0;
-        const exit = stopHit ? m.stop : sign * (mark - m.tp2) >= 0 ? m.tp2 : mark;
-        const pnl = round2(m.realized + (exit - m.entry) * sign * m.contracts * cv);
-        const reason = stopHit ? (m.tp1_hit ? "Trailing stop" : m.breakeven ? "Break-even stop" : "Stop loss") : exit === m.tp2 ? "TP2" : "Closed on exchange";
-        const p: Position = {
-          id: m.id, signal_id: m.signal_id, instrument: m.symbol, direction: m.direction, volume: 0, initial_volume: m.initial_contracts,
-          entry_price: m.entry, stop_loss: m.stop, initial_stop: m.initial_stop, take_profit_1: m.tp1, take_profit_2: m.tp2, opened_at: m.opened_at,
-          status: "closed", closed_at: Date.now() / 1000, exit_price: roundTo(exit, specFor(m.symbol).digits), realized_pnl: pnl, unrealized_pnl: 0,
-          tp1_hit: m.tp1_hit, breakeven: m.breakeven, venue: "delta", close_reason: reason
-        };
-        this.db.recordTrade(p);
-        delete this.managed[m.symbol];
-        changed = true;
-        const type = reason === "TP2" ? "tp2" : reason === "Stop loss" ? "sl" : "stop";
-        this.hub.emit("position_event", { instrument: m.symbol, type, position: p, reason });
-        this.toast({ level: pnl >= 0 ? "success" : "error", title: `Delta position closed · ${reason}`, message: `${m.symbol} ${m.direction} · ≈ $${pnl.toFixed(2)}` });
-        continue;
-      }
-      const mark = pos.markPrice || m.last_mark;
-      m.last_mark = mark;
-      m.contracts = pos.contracts;
-      const r = Math.abs(m.entry - m.initial_stop);
-      const reached = (lvl: number) => sign * (mark - lvl) >= 0;
-      if (!m.breakeven && reached(m.entry + sign * r)) {
-        if (await this.delta.updateStop(m.symbol, m.direction, m.entry, m.tp2)) {
-          m.stop = m.entry;
-          m.breakeven = true;
-          changed = true;
-          this.toast({ level: "info", title: "Delta stop moved to break-even", message: `${m.symbol} ${m.direction}` });
-        }
-      }
-      if (!m.tp1_hit && reached(m.tp1)) {
-        const half = Math.floor(m.contracts / 2);
-        m.tp1_hit = true;
-        changed = true;
-        if (half >= 1 && half < m.contracts) {
-          const res = await this.delta.reduce(m.symbol, m.direction, half, `${m.signal_id}:tp1`, "TP1 partial");
-          if (res.ok) {
-            m.realized = round2(m.realized + ((res.price ?? mark) - m.entry) * sign * half * cv);
-            m.contracts -= half;
-          }
-        }
-        if (!m.breakeven && (await this.delta.updateStop(m.symbol, m.direction, m.entry, m.tp2))) {
-          m.stop = m.entry;
-          m.breakeven = true;
-        }
-        this.hub.emit("position_event", { instrument: m.symbol, type: "tp1", position: this.positions().find((p) => p.instrument === m.symbol) });
-        this.toast({ level: "success", title: "TP1 · 50% closed on Delta", message: `${m.symbol} ${m.direction}` });
-      }
-      if (m.tp1_hit) {
-        const trail = mark - sign * r;
-        if (sign * (trail - m.stop) >= 0.25 * r && (await this.delta.updateStop(m.symbol, m.direction, trail, m.tp2))) {
-          m.stop = roundTo(trail, specFor(m.symbol).digits);
-          changed = true;
-        }
-      }
-    }
-    if (changed) this.db.kvSet("managed", this.managed);
+  private async readFills() {
+    if (!this.delta.hasCredentials) return;
+    try { this.deltaFills = await this.delta.fills(); this.fillsError = null; this.fillsUpdatedAt = now(); }
+    catch (e) { this.fillsError = message(e); }
   }
-
-  // ---------------------------------------------------------------- actions
-  emitMode(): void {
-    this.hub.emit("mode", { mode: this.modeLabel(), data_source: this.dataSource, execution: this.execution, banner: this.banner });
-  }
-
-  async setMode(body: { data_source?: string; execution?: string }): Promise<{ ok: boolean; message?: string }> {
-    if (body.execution === "delta") {
-      await this.refreshHealth();
-      if (!this.delta.isReady()) return { ok: false, message: `Delta execution unavailable. ${this.delta.lastHealth.issues[0]?.fix ?? "Configure Delta first."}` };
-      if (this.dataSource !== "delta") {
-        try {
-          await this.loadLiveHistory();
-        } catch (err) {
-          return { ok: false, message: `Could not load Delta market data: ${err instanceof Error ? err.message : String(err)}` };
-        }
+  private async cycle(symbol: string, bars: Bar[]) {
+    const id = this.selected, last = bars.at(-1)!;
+    const generation = this.generation;
+    const summary: CycleSummary = { instrument: symbol, cycle_id: randomUUID(), ts: now(), outcome: "none", setup: null, decision: null,
+      checks: [], levels: [], trace: [], execution: {} };
+    const note = (agent: string, status: "ok"|"skip"|"veto"|"error", text: string) => {
+      const row = { agent, status, summary: text, data: { strategy_id: id }, confidence: 0, timestamp: now(), latency_ms: 0 };
+      summary.trace.push(row); this.hub.emit("agent", { ...row, instrument: symbol, cycle_id: summary.cycle_id });
+    };
+    this.hub.emit("cycle_start", { instrument: symbol, cycle_id: summary.cycle_id });
+    let signal: string | null = null;
+    try {
+      if (!id) { note("Candidate","skip","No catalog strategy selected"); return; }
+      if (bars.length < 50 || last.time !== latestClosed() || !bars.slice(-50).every((b,i) => b.time === last.time - (49-i)*FIVE_MIN)) throw new Error("Stale or noncontiguous candle history");
+      note("Market","ok","Fresh closed Delta 5m candles");
+      const direction = evaluateCandidate(id, bars);
+      if (!direction) { note("Candidate","skip","No signal on this closed candle"); return; }
+      signal = `${id}:${symbol}:${last.time}`;
+      note("Candidate","ok",`${id}: ${direction}`);
+      if (!this.armed) { summary.outcome = "skipped"; note("Execution","skip","Observation only"); return; }
+      if (last.time + FIVE_MIN < this.armedAt || !fresh(last.time + FIVE_MIN,30)) {
+        summary.outcome = "skipped"; note("Execution","skip","Awaiting a new close after arming"); return;
       }
-      this.execution = "delta";
-      this.dataSource = "delta";
       await this.syncDelta();
-    } else if (body.execution === "paper") {
-      this.execution = "paper";
-    }
-    if (body.data_source === "demo") {
-      if (this.execution === "delta") return { ok: false, message: "Delta execution needs Delta market data. Switch execution to Paper first." };
-      this.dataSource = "demo";
-    } else if (body.data_source === "delta" && this.dataSource !== "delta") {
+      const t = now();
+      const blocked = this.environmentBlock(false);
+      if (!this.armed || generation !== this.generation || blocked) throw new Error(blocked ?? "No longer armed");
+      if (this.deltaPositions.length || this.workingOrders !== false) {
+        summary.outcome = "skipped";
+        note("Execution", "skip", "Waiting for existing demo exposure or working orders to clear");
+        return;
+      }
+      const [quote, product] = await Promise.all([this.delta.ticker(symbol), this.delta.loadProduct(symbol, true)]);
+      const entryBlock = this.environmentBlock();
+      if (!this.armed || generation !== this.generation || entryBlock) throw new Error(entryBlock ?? "No longer armed");
+      if (!product.live || quote.spreadPct > this.rules.spread_limit_pct || !fresh(t) || last.time !== latestClosed()) throw new Error("Product, spread or price freshness check failed");
+      if (this.rules.session_filter && !this.rules.allowed_sessions.includes(sessionFor(t))) throw new Error("Outside allowed session");
+      if (this.rules.news_filter && this.rules.news_hours_utc.includes(new Date(t * 1000).getUTCHours())) throw new Error("Blocked news hour");
+      if (now() - this.db.kvGet<number>(`last-entry:${symbol}`, 0) < this.rules.cooldown_minutes * 60) throw new Error("Instrument on cooldown");
+      const spec = specFor(symbol), long = direction === "long";
+      const limit = long ? quote.ask : quote.bid;
+      const grid = (p: number, up: boolean) => roundTo((up ? Math.ceil(p / spec.tickSize) : Math.floor(p / spec.tickSize)) * spec.tickSize, spec.digits);
+      const bracket = bracketPrices(limit, direction);
+      const stop = grid(bracket.stop, long), target = grid(bracket.target, !long);
+      const dist = (long ? 1 : -1) * (limit - stop);
+      const rr = (long ? 1 : -1) * (target - limit) / dist;
+      if (dist <= 0 || !Number.isFinite(rr) || rr + 1e-8 < this.rules.min_rr) throw new Error("Bracket fails minimum risk/reward after rounding");
+      // Price gaps/fees can exceed planned stop risk. Limit exposure to available cash (no borrowed buying power).
+      const riskBudget = this.equity()! * Math.min(this.rules.risk_per_trade_pct, this.rules.max_risk_per_trade_pct) / 100;
+      const perContract = budgetedLossPerContract(limit, stop, spec.contractValue, product.feeBps, quote.spreadPct);
+      const contracts = Math.floor(Math.min(spec.maxContracts, riskBudget / perContract,
+        this.deltaWallet!.available * .95 / (spec.contractValue * limit)));
+      if (!Number.isSafeInteger(contracts) || contracts < spec.minContracts) throw new Error("Insufficient risk budget or free collateral for one contract");
+      const plan = { signalId: signal, symbol, direction: long ? "LONG" as const : "SHORT" as const, contracts, limit, stop, target };
+      if (!this.db.claimSignal(signal, plan)) throw new Error("Duplicate signal or unresolved demo submission");
+      note("Guardian","ok",`${contracts} contracts; planned stop loss including estimated costs ${roundTo(perContract * contracts,2)} USD`);
+      this.permit = () => this.generation === generation && this.armed && !this.environmentBlock() && fresh(t) && fresh(quote.timestamp) && last.time === latestClosed();
       try {
-        await this.loadLiveHistory();
-        this.dataSource = "delta";
-      } catch (err) {
-        return { ok: false, message: `Delta India market data unavailable: ${err instanceof Error ? err.message : String(err)}` };
-      }
+        this.db.kvSet(`last-entry:${symbol}`, now());
+        const result = await this.delta.placeEntry(plan);
+        this.db.finishSignal(signal, result.ok ? "filled" : "unknown", result.message, result.orderId == null ? null : String(result.orderId), result.price ?? null);
+        summary.outcome = result.ok ? "taken" : "error"; summary.execution = { venue: "delta", ...result };
+        note("Execution", result.ok ? "ok" : "error", result.message);
+        if (result.ok) this.hub.emit("trade_placed", { instrument: symbol, signal_id: signal, direction: plan.direction, volume: result.contracts, price: result.price, venue:"delta" });
+        else this.disarm();
+      } finally { this.permit = null; }
+    } catch (err) {
+      if (this.armed) this.disarm();
+      summary.outcome = "vetoed"; note("Guardian","veto", message(err));
+    } finally {
+      if (signal) this.db.logDecision(symbol, signal, summary.outcome, summary.trace.at(-1)?.summary ?? "", summary.trace);
+      this.lastCycle[symbol] = summary;
+      this.hub.emit("cycle_end", summary);
+      this.cycles++;
     }
-    this.banner = null;
-    if (this.dataSource === "delta") this.stream.connect();
-    for (const k of Object.keys(this.lastCycle)) delete this.lastCycle[k];
-    this.guardian.day_start_equity = this.equity();
-    this.emitMode();
-    return { ok: true };
   }
-
-  updateSettings(rules: RiskRules, params: StrategyParams): void {
-    this.rules = rules;
-    this.params = params;
-    this.db.kvSet("rules", rules);
-    this.db.kvSet("params", params);
-    this.hub.emit("settings", { rules, params });
-  }
-
-  runDemoScenario(instrument?: string): Record<string, unknown> {
-    if (this.dataSource !== "demo") return { ok: false, message: "Demo scenarios run in Demo mode only." };
-    const inst = instrument && this.cfg.instruments.includes(instrument) ? instrument : this.cfg.instruments[0]!;
-    const market = this.feed.markets[inst]!;
-    if (market.plan) return { ok: false, message: "A sweep is already playing out. Watch the chart!" };
-    const levels = mapLiquidity(market.candles.slice(-900), this.params);
-    const plan = market.forceScenario(levels);
-    if (!plan) return { ok: false, message: "No suitable liquidity level near price right now; try again shortly." };
-    // make sure the planted level is not on cooldown from earlier demo signals
-    for (const key of [...this.guardian.recent_signals.keys()]) if (key.startsWith(inst)) this.guardian.recent_signals.delete(key);
-    this.scenarioUntil = Date.now() + 40_000;
-    this.toast({ level: "info", title: "Demo scenario armed", message: `${inst}: price will hunt the ${plan.side} at ${plan.level}.` });
-    return { ok: true, instrument: inst, ...plan };
-  }
-
-  async engageKillSwitch(engaged: boolean, closeAll: boolean): Promise<Record<string, unknown>> {
-    this.guardian.kill_switch = engaged;
-    const closed: string[] = [];
-    if (engaged && closeAll) {
-      const prices = Object.fromEntries(this.cfg.instruments.map((s) => [s, this.lastPrice(s)]));
-      for (const p of this.paper.closeAll(prices, "Kill switch", this.clock())) {
-        this.db.recordTrade(p);
-        closed.push(p.id);
+  async poll() {
+    if (this.polling || !this.running) return;
+    this.polling = true;
+    try {
+      for (const symbol of this.cfg.instruments) {
+        const prev = this.history[symbol];
+        const count = prev?.at(-1)?.time === latestClosed() || prev?.at(-1)?.time === latestClosed() - FIVE_MIN ? 6 : 600;
+        const bars = await this.delta.candles5m(symbol, count);
+        if (!bars.length || bars.at(-1)?.time !== latestClosed()) throw new Error(`Awaiting fresh Delta candles for ${symbol}`);
+        const series = [...(prev ?? []).filter(b => b.time < bars[0]!.time), ...bars].slice(-2000);
+        this.history[symbol] = series;
+        const last = series.at(-1)!;
+        this.market({ [symbol]: this.chartBars(symbol,1)[0]! });
+        if (this.running && !this.paused && last.time !== this.seen[symbol]) { this.seen[symbol] = last.time; await this.cycle(symbol,series); }
       }
-      if (this.delta.lastHealth.authenticated) {
-        for (const p of await this.delta.positions(this.cfg.instruments).catch(() => [])) {
-          const res = await this.delta.closePosition(p.symbol, "Kill switch");
-          if (res.ok) closed.push(p.symbol);
-        }
-        await this.syncDelta();
-      }
-    }
-    this.hub.emit("kill_switch", { engaged, closed });
-    this.toast(engaged
-      ? { level: "error", title: "KILL SWITCH ENGAGED", message: `New orders blocked.${closed.length ? ` Closed ${closed.length} position(s).` : ""}` }
-      : { level: "success", title: "Kill switch released", message: "AEGIS will accept new signals again." });
-    return { ok: true, engaged, closed };
+      this.banner = null;
+    } catch (e) { this.banner = message(e); if (this.armed) this.disarm(); }
+    finally { this.polling = false; }
   }
-
-  closePaper(id: string): Record<string, unknown> {
-    const pos = this.paper.positions.get(id);
-    if (!pos) return { ok: false, message: "Position not found (it may have just closed)." };
-    this.paper.close(pos, this.lastPrice(pos.instrument), "Manual close", this.clock());
-    this.db.recordTrade(pos);
-    this.hub.emit("position_event", { instrument: pos.instrument, type: "manual", position: pos });
-    return { ok: true, position: pos };
+  async start() {
+    if (this.running) return;
+    this.running = true; this.stream.connect();
+    await Promise.all([this.refreshHealth(), this.syncDelta(), this.readFills()]);
+    if (!this.running) return;
+    this.timers.push(setInterval(() => void this.refreshHealth(), 15_000), setInterval(() => void this.syncDelta(), 3000),
+      setInterval(() => void this.readFills(), 15_000), setInterval(() => void this.poll(), 5000));
+    await this.poll();
   }
-
-  async closeDelta(symbol: string): Promise<OrderResult> {
-    const m = this.managed[symbol];
-    if (m) {
-      const pos = this.deltaPositions.find((p) => p.symbol === symbol);
-      if (pos) m.last_mark = pos.markPrice;
-    }
-    const res = await this.delta.closePosition(symbol, "Manual close");
-    await this.syncDelta();
-    return res;
-  }
-
-  /** Places the minimum size on the Delta Demo account, then closes it, so it appears in Delta's order history. */
-  async sendTestOrder(symbol: string): Promise<OrderResult> {
-    if (this.cfg.deltaEnvironment !== "testnet") return { ok: false, message: "Test orders are only allowed on the Delta Demo account.", symbol };
-    if (!this.delta.isReady()) return { ok: false, message: this.delta.lastHealth.issues[0]?.fix ?? "Delta is not ready.", symbol };
-    if (this.deltaPositions.some((p) => p.symbol === symbol)) return { ok: false, message: `${symbol} already has an open position; test skipped.`, symbol };
-    const t = await this.delta.ticker(symbol);
-    const signalId = `TEST-${symbol}-${Date.now()}`;
-    this.db.claimSignal(signalId, { test: true });
-    const res = await this.delta.placeEntry({ signalId, symbol, direction: "LONG", contracts: 1, stop: t.mark * 0.98, target: t.mark * 1.02, leverage: 1 });
-    this.db.finishSignal(signalId, res.ok ? "filled" : "failed", res.message, res.orderId != null ? String(res.orderId) : null, res.price ?? null);
-    if (!res.ok) return res;
-    await sleep(3_000);
-    const close = await this.delta.closePosition(symbol, "Test order close");
-    return { ...res, ok: close.ok, message: close.ok ? `Test order filled @ ${res.price} and closed.` : `Test order filled but close failed: ${close.message}` };
+  async stop() { this.running = false; this.disarm(); this.stream.close(); this.timers.splice(0).forEach(clearInterval); }
+  async writeReview(key: string) {
+    const rows = this.db.decisionsSince(Date.parse(`${key}T00:00:00Z`) / 1000);
+    const text = `${rows.length} candidate decisions; ${rows.filter(r => r.outcome === "taken").length} confirmed demo entries. Closed-trade P/L is not reconciled.`;
+    this.db.saveReview(key,text); return text;
   }
 }

@@ -1,5 +1,7 @@
 # AI Context
 
+The shipped desk is now **Delta India demo only**. See the [current runtime and risk contract](../backend/src/desk/README.md) and [strategy evaluation](strategy-research.md). Older production, AI-agent, and UI notes below describe legacy architecture, not permission to enable live execution in the desk.
+
 Sunny Crypto Manager is a greenfield, risk-first BTC strategy dashboard for Delta Exchange India. The source of truth is `docs/MASTER_PROJECT_SPECIFICATION.md` and the agreed implementation scope in `MVP_BUILD_PROMPTS.md`.
 
 ## Non-negotiable invariants

@@ -3,9 +3,6 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    env_file:
-      - path: .env
-        required: false
     environment:
       NODE_ENV: production
       PORT: 4000
@@ -14,26 +11,15 @@ services:
       DESK_DATABASE_PATH: /app/data/desk.sqlite
       DESK_INSTRUMENTS: ${DESK_INSTRUMENTS:-BTCUSD,ETHUSD}
       DESK_DEMO_MODE: ${DESK_DEMO_MODE:-false}
-      DESK_EXECUTION: ${DESK_EXECUTION:-paper}
+      DESK_EXECUTION: ${DESK_EXECUTION:-disabled}
       DESK_STARTING_BALANCE: ${DESK_STARTING_BALANCE:-10000}
-      DESK_MAX_LEVERAGE: ${DESK_MAX_LEVERAGE:-25}
-      ANALYST_API_KEY: ${ANALYST_API_KEY:-}
-      ANALYST_BASE_URL: ${ANALYST_BASE_URL:-}
-      ANALYST_MODEL: ${ANALYST_MODEL:-}
-      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
-      DELTA_API_KEY: ${DELTA_API_KEY:-}
-      DELTA_API_SECRET: ${DELTA_API_SECRET:-}
+      DESK_MAX_LEVERAGE: ${DESK_MAX_LEVERAGE:-2}
+      DELTA_IP_FAMILY: ${DELTA_IP_FAMILY:-4}
       DELTA_DEMO_API_KEY: ${DELTA_DEMO_API_KEY:-}
       DELTA_DEMO_API_SECRET: ${DELTA_DEMO_API_SECRET:-}
-      DELTA_LIVE_API_KEY: ${DELTA_LIVE_API_KEY:-}
-      DELTA_LIVE_API_SECRET: ${DELTA_LIVE_API_SECRET:-}
       DELTA_ENV: ${DELTA_ENV:-testnet}
-      LIVE_TRADING_CONFIRMED: ${LIVE_TRADING_CONFIRMED:-}
-      MAX_LEVERAGE: ${MAX_LEVERAGE:-2}
-      DAILY_LOSS_PERCENT: ${DAILY_LOSS_PERCENT:-2}
-      MAX_DAILY_LOSS: ${MAX_DAILY_LOSS:-1000}
     ports:
-      - "4000:4000"
+      - "127.0.0.1:4000:4000"
     volumes:
       - ./data:/app/data
     restart: unless-stopped
@@ -52,5 +38,5 @@ services:
       backend:
         condition: service_healthy
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     restart: unless-stopped

@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import type { ExecLogRow } from "./delta-bridge.js";
-import type { AgentResult, ExecutionVenue, Position } from "./types.js";
+import type { AgentResult, ExecutionVenue } from "./types.js";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS decisions (
@@ -57,7 +57,19 @@ export class DeskDatabase {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
-    this.db.exec(SCHEMA);
+    this.db.transaction(() => {
+      // Older versions mixed simulations, live and testnet rows, with no reliable provenance.
+      // Preserve ALL of them, including old settings, unmanaged positions and review text.
+      if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='desk_demo_v2'").get()) {
+        for (const table of ["decisions", "trades", "orders", "exec_log", "reviews", "kv"]) {
+          if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) {
+            this.db.exec(`ALTER TABLE ${table} RENAME TO legacy_unverified_${table}`);
+          }
+        }
+        this.db.exec("CREATE TABLE desk_demo_v2 (version INTEGER PRIMARY KEY); INSERT INTO desk_demo_v2 VALUES (2)");
+      }
+      this.db.exec(SCHEMA);
+    }).immediate();
   }
 
   close(): void {
@@ -82,13 +94,6 @@ export class DeskDatabase {
     return rows.map((r) => ({ ...r, trace: JSON.parse(r.trace || "[]") as AgentResult[] }));
   }
 
-  recordTrade(p: Position): void {
-    this.db.prepare("INSERT OR REPLACE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(
-      p.id, p.signal_id, p.instrument, p.direction, p.venue, p.initial_volume, p.entry_price, p.exit_price,
-      p.realized_pnl, p.opened_at, p.closed_at, p.close_reason
-    );
-  }
-
   trades(limit = 500, venue?: ExecutionVenue): TradeRow[] {
     const query = venue
       ? this.db.prepare("SELECT * FROM trades WHERE venue=? ORDER BY closed_at DESC LIMIT ?")
@@ -102,9 +107,14 @@ export class DeskDatabase {
 
   /** Atomically reserve a signal for exchange execution. False if it was already claimed. */
   claimSignal(signalId: string, request: Record<string, unknown>): boolean {
-    const r = this.db.prepare("INSERT OR IGNORE INTO orders (signal_id, ts, status, request) VALUES (?,?,?,?)")
+    const r = this.db.prepare(`INSERT OR IGNORE INTO orders (signal_id, ts, status, request)
+      SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM orders WHERE status IN ('pending','unknown'))`)
       .run(signalId, Date.now() / 1000, "pending", JSON.stringify(request));
     return r.changes === 1;
+  }
+
+  hasUnresolvedOrder(): boolean {
+    return Boolean(this.db.prepare("SELECT 1 FROM orders WHERE status IN ('pending','unknown') LIMIT 1").get());
   }
 
   finishSignal(signalId: string, status: string, message: string, orderId: string | null, price: number | null): void {

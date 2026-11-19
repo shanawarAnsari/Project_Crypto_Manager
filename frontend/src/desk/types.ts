@@ -51,18 +51,23 @@ export interface Position {
   unrealized_pnl: number; realized_pnl: number; tp1_hit: boolean; breakeven: boolean; venue: "paper" | "delta"; close_reason: string | null;
 }
 
+export interface ExchangePosition {
+  id: string; instrument: string; direction: "LONG" | "SHORT"; volume: number; entry_price: number; mark_price: number;
+  unrealized_pnl: number; status: "open"; venue: "delta";
+}
+
 export interface DeltaIssue { code: string; message: string; fix: string }
 export interface AccountState {
   environment: "testnet" | "production";
   wallet: { balance: number; available: number; asset: string } | null;
   equity: number | null;
-  positions: Position[];
+  positions: ExchangePosition[];
   fills?: DeltaFill[];
   updated_at: number | null;
   error: string | null;
 }
 export interface DeltaFill {
-  id: string; symbol: string; side: "buy" | "sell"; size: number; price: number; commission: number; notional: number;
+  id: string; symbol: string; side: "buy" | "sell"; size: number; price: number; commission: number | null; notional: number | null;
   order_id: string | null; role: string; time: number;
 }
 export type Quotes = Record<string, { mark: number; updated_at: number }>;
@@ -90,10 +95,10 @@ export interface Params {
 export interface Toast { id: number; level: "success" | "info" | "warning" | "error"; title: string; message: string }
 
 export interface JournalRow { id: number; ts: number; instrument: string; signal_id: string | null; outcome: string; summary: string; trace: AgentResult[] }
-export interface TradeRow { id: string; instrument: string; direction: string; venue: string; volume: number; entry: number; exit: number | null; pnl: number; opened_at: number; closed_at: number | null; reason: string | null }
+export interface TradeRow { id: string; signal_id: string | null; instrument: string; direction: string; venue: string; volume: number; entry: number; exit: number | null; pnl: number; opened_at: number; closed_at: number | null; reason: string | null }
 
 export interface BacktestResult {
-  instrument: string; source: "synthetic" | "delta"; days: number; candles: number; elapsed_s: number;
+  instrument: string; source: "delta"; days: number; candles: number; elapsed_s: number;
   stats: { trades: number; win_rate: number; profit_factor: number; max_drawdown_pct: number; net_pnl: number; return_pct: number;
     avg_win: number; avg_loss: number; expectancy: number; final_equity: number; starting_balance: number };
   decisions: { taken: number; vetoed: number };
@@ -104,12 +109,20 @@ export interface BacktestResult {
   disclaimer: string;
 }
 
+export interface LabStrategy { id: string; name: string; family: string }
+export interface LabCoverage { instrument: string; resolution: string; launchTime: number; earliestStart: number }
+export interface HistoricalBacktest extends Omit<BacktestResult, "stats" | "source"> {
+  requestedStart: number; coverage: LabCoverage;
+  strategyId: string; strategyName: string; source: "delta"; start: number; end: number;
+  resolution: string; feeBps: number; slippageBps: number; spreadBps: number;
+  stats: Omit<BacktestResult["stats"], "profit_factor"> & {
+    profit_factor: number | null; gross_pnl: number; fees: number; slippage: number; spread: number;
+  };
+}
+
 export const AGENTS: { name: string; role: string; color: string; blurb: string }[] = [
-  { name: "Scout", role: "Data", color: "#22d3ee", blurb: "Pulls 5M candles (resampled to 15M/4H/Daily), spread and account state from Delta India or the demo feed." },
-  { name: "Cartographer", role: "Liquidity", color: "#38bdf8", blurb: "Maps PDH/PDL, Asian range, 4H swings and equal highs/lows where stops rest." },
-  { name: "Hunter", role: "Sweep", color: "#a78bfa", blurb: "Detects a wick through a level plus a displacement close back inside the range." },
-  { name: "Analyst", role: "LLM", color: "#8b5cf6", blurb: "Reviews the candidate and returns strict JSON. It can only refine or reject." },
-  { name: "Guardian", role: "AEGIS", color: "#10b981", blurb: "Hard vetoes: spread, drawdown, RR, confidence, cooldown, contract sizing, margin." },
-  { name: "Executioner", role: "Execution", color: "#f59e0b", blurb: "Sends approved orders to paper or Delta India with an exchange bracket, BE and partials." },
-  { name: "Chronicler", role: "Journal", color: "#f472b6", blurb: "Logs every decision with the full trace and writes the end-of-day review." }
+  { name: "Market", role: "Exchange data", color: "#22d3ee", blurb: "Checks for recent, contiguous closed candles." },
+  { name: "Candidate", role: "Strategy signal", color: "#a78bfa", blurb: "Runs the selected deterministic strategy on closed bars." },
+  { name: "Guardian", role: "Risk checks", color: "#10b981", blurb: "Checks account exposure, margin, cooldown, spread, drawdown and contract risk." },
+  { name: "Execution", role: "Demo orders", color: "#f59e0b", blurb: "Submits approved bracket orders to Delta India testnet only." }
 ];

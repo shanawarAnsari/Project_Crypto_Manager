@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { AgentFeed, Pipeline, WhyThisTrade } from "./components/Analysis";
+import { AgentFeed, Pipeline, SignalDetails } from "./components/Analysis";
 import { Banner, KpiStrip, TopBar } from "./components/Header";
 import { BacktestLab, Journal } from "./components/Lab";
 import { Settings, Toasts } from "./components/Settings";
 import { SweepChart } from "./components/SweepChart";
-import { DeltaStatus, ExecutionLog, Positions, SignalFeed } from "./components/Trading";
+import { DeltaStatus, ExecutionLog, Positions, SignalFeed, TradeHistory } from "./components/Trading";
 import { connectLive } from "./store";
 
 const TABS = ["Delta India", "Backtest", "Journal", "Settings"] as const;
@@ -21,13 +21,14 @@ export default function DeskApp() {
         <KpiStrip />
         <div className="grid gap-4 xl:grid-cols-3">
           <div className="xl:col-span-2"><SweepChart /></div>
-          <WhyThisTrade />
+          <SignalDetails />
         </div>
         <Pipeline />
         <div className="grid gap-4 xl:grid-cols-3">
           <div className="xl:col-span-2"><Positions /></div>
           <SignalFeed />
         </div>
+        <TradeHistory />
         <AgentFeed />
         <section className="panel">
           <header className="panel-head">

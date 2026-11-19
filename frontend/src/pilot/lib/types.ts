@@ -1,7 +1,7 @@
 import type { AgentResult as DeskAgentResult } from "../../desk/types";
 
 export type {
-  AccountState, BacktestResult, Candle, Check, CycleSummary, Decision, DeltaFill, DeltaHealth, DeltaIssue, ExecLogRow, JournalRow, Kpis, Level,
+  AccountState, BacktestResult, Candle, Check, CycleSummary, Decision, DeltaFill, DeltaHealth, DeltaIssue, ExchangePosition, ExecLogRow, JournalRow, Kpis, Level,
   Params, Position, Quotes, Rules, SessionInfo, Setup, Toast, TradeRow
 } from "../../desk/types";
 

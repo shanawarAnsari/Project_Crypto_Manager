@@ -31,6 +31,7 @@ export interface AppServices {
 
 export function createServices(): AppServices {
   const config = loadConfig();
+  if (config.deltaEnvironment !== "testnet") throw new Error("The application is demo-only. Set DELTA_ENV=testnet.");
   const db = createDatabase(config.databasePath, leverageCeiling(config.deltaEnvironment));
   const botState = new SqliteBotStateRepository(db);
   const candles = new SqliteCandleRepository(db);

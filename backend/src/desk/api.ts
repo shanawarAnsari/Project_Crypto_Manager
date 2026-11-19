@@ -3,8 +3,7 @@ import type { Server } from "node:http";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { WebSocketServer } from "ws";
 import { PIPELINE_ORDER } from "./agents.js";
-import { runBacktest } from "./backtest.js";
-import { CONFIRM_PHRASE } from "./delta-bridge.js";
+import { labRoutes } from "./lab-api.js";
 import type { Desk } from "./orchestrator.js";
 import { mergeRules, validateRules } from "./risk.js";
 import { mergeParams, validateParams } from "./strategy.js";
@@ -23,6 +22,13 @@ export function createDeskApp(desk: Desk): express.Express {
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "100kb" }));
+  app.use((req, res, next) => {
+    if (req.headers["sec-fetch-site"] === "cross-site") {
+      res.status(403).json({ ok: false, message: "Cross-site desk access is not allowed." });
+    } else if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && !req.is("application/json")) {
+      res.status(415).json({ ok: false, message: "Desk commands require application/json." });
+    } else next();
+  });
 
   app.get("/api/health", wrap(() => ({
     ok: true, mode: desk.modeLabel(), data_source: desk.dataSource, execution: desk.execution, analyst: desk.analyst.mode,
@@ -30,7 +36,8 @@ export function createDeskApp(desk: Desk): express.Express {
     delta_authenticated: desk.delta.lastHealth.authenticated, delta_env: desk.cfg.deltaEnvironment, time: new Date().toISOString()
   })));
 
-  app.get("/api/state", wrap(() => ({ ...desk.snapshot(), confirm_phrase: CONFIRM_PHRASE })));
+  app.get("/api/state", wrap(() => ({ ...desk.snapshot(), strategy_id: desk.strategyId })));
+  app.put("/api/strategy", wrap((req) => desk.selectStrategy(String(body(req).strategy_id ?? ""))));
 
   app.get("/api/candles", wrap((req) => {
     const instrument = String(req.query.instrument ?? desk.cfg.instruments[0]);
@@ -64,32 +71,23 @@ export function createDeskApp(desk: Desk): express.Express {
     return { ok: true, errors: [], rules, params };
   }));
 
-  app.post("/api/kill", wrap((req) => desk.engageKillSwitch(Boolean(body(req).engaged), Boolean(body(req).close_all))));
+  app.post("/api/kill", wrap((req, res) => {
+    const b = body(req);
+    if (typeof b.engaged !== "boolean" || (b.close_all !== undefined && typeof b.close_all !== "boolean"))
+      return res.status(400).json({ ok: false, message: "Explicit boolean kill-switch command required." });
+    return desk.engageKillSwitch(b.engaged, b.close_all === true);
+  }));
 
-  app.post("/api/pause", wrap((req) => {
-    desk.paused = Boolean(body(req).paused);
+  app.post("/api/pause", wrap((req, res) => {
+    const paused = body(req).paused;
+    if (typeof paused !== "boolean") return res.status(400).json({ ok: false, message: "Explicit boolean pause command required." });
+    desk.paused = paused;
     desk.hub.emit("paused", { paused: desk.paused });
     return { ok: true, paused: desk.paused };
   }));
 
-  app.post("/api/demo/scenario", wrap((req) => desk.runDemoScenario(typeof body(req).instrument === "string" ? String(body(req).instrument) : undefined)));
-
-  app.post("/api/paper/close/:id", wrap((req) => desk.closePaper(String(req.params.id))));
-
-  app.post("/api/backtest", wrap(async (req) => {
-    const b = body(req);
-    const instrument = String(b.instrument ?? desk.cfg.instruments[0]);
-    if (!desk.cfg.instruments.includes(instrument)) return { ok: false, message: "Unknown instrument" };
-    const source = b.source === "delta" ? "delta" : "synthetic";
-    const days = Math.max(source === "delta" ? 3 : 10, Math.min(Number(b.days) || 30, source === "delta" ? 60 : 180));
-    const candles = source === "delta" ? await desk.delta.candles5m(instrument, days * 288) : undefined;
-    if (candles && candles.length < 400) return { ok: false, message: "Not enough Delta India history returned for this range." };
-    const res = await runBacktest({
-      instrument, days, rules: desk.rules, params: desk.params, startingBalance: desk.cfg.startingBalance, seed: Number(b.seed) || 42,
-      ...(candles ? { candles } : {}), progress: (x) => desk.hub.emit("backtest_progress", { progress: Math.round(x * 1000) / 1000 })
-    });
-    return { ok: true, ...res };
-  }));
+  app.use(labRoutes(desk.cfg.instruments, desk.cfg.startingBalance,
+    progress => desk.hub.emit("backtest_progress", { progress: Math.round(progress * 1000) / 1000 })));
 
   app.post("/api/review", wrap(async () => {
     const day = new Date().toISOString().slice(0, 10);
@@ -100,30 +98,6 @@ export function createDeskApp(desk: Desk): express.Express {
   app.get("/api/delta/status", wrap(async () => ({ ...(await desk.refreshHealth()), mode: desk.modeLabel() })));
   app.post("/api/delta/reconnect", wrap(async () => ({ ...(await desk.refreshHealth()), mode: desk.modeLabel() })));
   app.get("/api/delta/log", wrap((req) => ({ log: desk.db.execLog(Math.max(1, Math.min(Number(req.query.limit) || 100, 500))) })));
-
-  app.post("/api/delta/live", wrap(async (req) => {
-    const b = body(req);
-    if (!b.enable) {
-      desk.delta.liveUnlocked = false;
-      await desk.refreshHealth();
-      return { ok: true, live_unlocked: false, message: "Live trading locked." };
-    }
-    if (desk.cfg.deltaEnvironment !== "production") return { ok: false, live_unlocked: false, message: "DELTA_ENV is testnet: the desk trades the Delta Demo account, no unlock needed." };
-    if (!desk.delta.allowLiveEnv) return { ok: false, live_unlocked: false, message: "Live is hard-disabled: set LIVE_TRADING_CONFIRMED=I_UNDERSTAND_REAL_MONEY in .env and restart." };
-    if (String(b.phrase ?? "").trim() !== CONFIRM_PHRASE) return { ok: false, live_unlocked: false, message: `Type exactly "${CONFIRM_PHRASE}" to unlock live trading.` };
-    desk.delta.liveUnlocked = true;
-    await desk.refreshHealth();
-    desk.toast({ level: "error", title: "LIVE TRADING UNLOCKED", message: "Orders may now be sent to your real-money Delta India account. Risk of loss is real." });
-    return { ok: true, live_unlocked: true, message: "Live trading unlocked for this session." };
-  }));
-
-  app.post("/api/delta/test-order", wrap(async (req) => {
-    const instrument = String(body(req).instrument ?? desk.cfg.instruments[0]);
-    if (!desk.cfg.instruments.includes(instrument)) return { ok: false, message: "Unknown instrument" };
-    const res = await desk.sendTestOrder(instrument);
-    desk.toast({ level: res.ok ? "success" : "error", title: "Delta test order", message: res.message });
-    return res;
-  }));
 
   app.post("/api/delta/close/:symbol", wrap((req) => desk.closeDelta(String(req.params.symbol))));
 

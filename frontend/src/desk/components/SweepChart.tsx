@@ -4,7 +4,7 @@ import {
 } from "lightweight-charts";
 import { useEffect, useRef, useState } from "react";
 import { loadCandles, pushToast, setState, useDesk } from "../store";
-import type { Candle, CycleSummary, Position } from "../types";
+import type { Candle, CycleSummary, ExchangePosition } from "../types";
 
 const toBar = (c: Candle) => ({ time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close });
 
@@ -20,7 +20,7 @@ function emaData(candles: readonly Candle[], period: number): { time: UTCTimesta
   return data;
 }
 
-function Canvas({ candles, cycle, positions, digits }: { candles: Candle[]; cycle: CycleSummary | undefined; positions: Position[]; digits: number }) {
+function Canvas({ candles, cycle, positions, digits }: { candles: Candle[]; cycle: CycleSummary | undefined; positions: ExchangePosition[]; digits: number }) {
   const host = useRef<HTMLDivElement>(null);
   const chartRef = useRef<{
     chart: IChartApi;
@@ -105,9 +105,7 @@ function Canvas({ candles, cycle, positions, digits }: { candles: Candle[]; cycl
       line(s.take_profit_2, "#35d39a", LineStyle.Dashed, "TP2");
     }
     for (const p of positions) {
-      if (s && p.signal_id === s.signal_id) continue;
       line(p.entry_price, "#f0b968", LineStyle.Solid, `${p.direction} OPEN`);
-      if (p.stop_loss) line(p.stop_loss, "#f07178", LineStyle.Dashed, p.breakeven ? "SL (BE)" : "SL");
     }
     c.markers.setMarkers(s ? [
       { time: s.sweep_time as UTCTimestamp, position: s.direction === "SHORT" ? "aboveBar" : "belowBar", color: "#f0b968", shape: "circle", text: `SWEEP ${s.level.name}` },
@@ -162,11 +160,11 @@ export function SweepChart() {
           ))}
         </div>
         <div className="flex items-center gap-3 text-xs text-terminal-muted">
-          <span>5M · {dataSource === "delta" ? `Delta India ${env === "testnet" ? "Demo" : "Live"} · ${stale ? "STALE / unavailable" : "Live feed"}` : "Synthetic demo feed"}</span>
+          <span>5M · Delta India {env === "testnet" ? "Demo" : "Live"} · {stale ? "STALE / unavailable" : "Live feed"}</span>
           {(quote && dataSource === "delta" || last) && <b className="num text-terminal-text">{(dataSource === "delta" && quote ? quote.mark : last!.close).toFixed(digits)}</b>}
         </div>
       </header>
-      {candles?.length ? <Canvas candles={candles} cycle={cycle} positions={positions} digits={digits} key={`${dataSource}:${instrument}`} /> : <div className="grid h-[380px] place-items-center text-sm text-terminal-muted">{dataSource === "delta" ? "Waiting for Delta India candles. No synthetic data substituted." : "Loading synthetic candles…"}</div>}
+      {candles?.length ? <Canvas candles={candles} cycle={cycle} positions={positions} digits={digits} key={`${dataSource}:${instrument}`} /> : <div className="grid h-[380px] place-items-center text-sm text-terminal-muted">Waiting for Delta India candles.</div>}
       <footer className="flex flex-wrap gap-4 border-t border-terminal-border px-4 py-2 text-[11px] text-terminal-muted">
         <span><i className="legend bg-terminal-red/60" /> buy-side liquidity (highs)</span>
         <span><i className="legend bg-terminal-blue/70" /> sell-side liquidity (lows)</span>

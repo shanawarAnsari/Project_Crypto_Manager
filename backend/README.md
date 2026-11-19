@@ -1,36 +1,43 @@
 # Sunny Crypto Manager backend
 
-## Liquidity Sweep Desk (default since 2026-11-19)
+## Delta India demo desk (default)
 
-`pnpm dev` / `pnpm start` now run the seven-agent Liquidity Sweep desk (`src/desk-server.ts`, see
-[src/desk/README.md](src/desk/README.md)). It binds `HOST` (default `127.0.0.1`) on `PORT` (4000) and stores its
-journal in `DESK_DATABASE_PATH` (default `./data/desk.sqlite`). Desk settings:
+`pnpm dev` / `pnpm start` run the demo-only candidate desk (`src/desk-server.ts`; see
+[src/desk/README.md](src/desk/README.md)). It binds to localhost by default and stores its isolated,
+provenance-checked journal in `DESK_DATABASE_PATH`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DESK_INSTRUMENTS` | `BTCUSD,ETHUSD` | Delta India perpetual symbols to trade |
-| `DESK_DEMO_MODE` | `false` | Live Delta feed and read-only account telemetry; `true` explicitly opts into synthetic data |
-| `DESK_EXECUTION` | `paper` | `delta` submits risk-approved orders to the testnet Demo account; requires testnet, Delta credentials, and live market data |
-| `DESK_DEMO_CYCLE_SECONDS` | `3` | Seconds per synthetic candle in Demo |
-| `DESK_STARTING_BALANCE` | `10000` | Paper account balance (USD) |
-| `DESK_MAX_LEVERAGE` | `25` | Upper bound for the leverage rule (production capped at 25) |
-| `ANALYST_API_KEY` / `ANALYST_BASE_URL` / `ANALYST_MODEL` | NVIDIA values | Any OpenAI-compatible LLM; empty key = rule-based Analyst |
+| `DELTA_ENV` | `testnet` | The desk rejects production/live endpoints |
+| `DELTA_DEMO_API_KEY` / `DELTA_DEMO_API_SECRET` | empty | Optional for public market observation; both required for Demo account data and orders |
+| `DELTA_IP_FAMILY` | `4` | Pin exchange API requests to IPv4 for API-key IP allowlists |
+| `DESK_INSTRUMENTS` | `BTCUSD,ETHUSD` | Allowed Delta India Demo symbols |
+| `DESK_EXECUTION` | `disabled` | Set to `delta` to permit arming from Settings; each process starts disarmed |
+| `DESK_MAX_LEVERAGE` | `2` | Hard maximum is 2x |
+| `DESK_STARTING_BALANCE` | `10000` | Historical Lab starting equity only; never shown as a wallet or used as an account fallback |
 
-Delta credentials reuse `DELTA_ENV` and `DELTA_DEMO_API_*` / `DELTA_LIVE_API_*`. The legacy chat agent below
-remains available via `pnpm dev:legacy`.
+Synthetic feeds, planted scenarios and the paper ledger have been removed from the default desk.
+The account panel displays only current exchange values; no credentials means account/order controls stay disabled.
+Live candles are display-only until closed, and strategy decisions use consecutive, fresh closed bars.
+An explicitly armed Demo scanner verifies the account before each entry, allows one open position, and waits
+for exchange positions and working orders to clear before another. Restarts, pause, or risk/data faults disarm it.
 
-The default desk displays the selected Delta account's balance and positions even with paper execution.
-WebSocket forming candles/mark prices update between 5M closes; strategy decisions use closed bars only.
-Outages retain the selected source and mark last-received values stale rather than substituting demo data.
-Only the selected environment's complete credential pair is used; account reads never unlock real-money orders.
+The separate `pnpm dev:legacy` entry point is retained for compatibility, is also restricted to Delta testnet,
+and is not the frontend's default app or a paper/synthetic feed.
 
-## Legacy chat agent
-Latest Demo policy revision (2026-11-18) supersedes older Demo numbers below: 100% USD-equity margin
-including entry fees, 100x leverage ceiling (lower configured/saved/product caps preserved), planned
-stop plus fees <=30% total USD equity, five UTC entry attempts, daily loss 50% bounded by MAX_DAILY_LOSS.
-No upward saved-cap migration; default/configured 2x stays valid. Production/legacy remains 2x.
-Test preview accepts integer leverage 1..100/default 1 and may narrow initial 1%/2% brackets to fit
-equity/daily budgets before explicit confirmation. No guarantee against liquidation or excess loss.
+### Historical strategy Lab
+
+`GET /api/strategies` returns `{ strategies: [{ id, name, family, lookback }, …] }`. To replay one candidate, `POST /api/backtest` with a configured `instrument`, `strategyId`, `resolution` (`5m`, `15m`, `1h`, `4h`, `1d`), `start` and `end`. Times are aligned UTC Unix **seconds**, start inclusive and end exclusive. Only closed candles within the last five calendar years are accepted. Optional assumptions are `feeBps` (minimum/default 5.9 per side, including GST), `slippageBps` (2 per side), and `spreadBps` (1 across the bid/ask). Raise the estimates to reflect higher actual costs.
+
+The Lab reads **public Delta India market history**, not a Demo account ledger. `GET /api/lab/coverage?instrument=BTCUSD&resolution=5m` returns `launchTime` and `earliestStart` in Unix seconds. The latter is the later of the five-year floor and the first aligned interval opening at or after the public product's `launch_time`. This is a listing boundary, not a guarantee of continuous history. A backtest inside the five-year limit trims a pre-listing start and returns both `requestedStart` and effective `start`, plus `coverage`. A wholly pre-listing or insufficient post-listing range fails before any candle query. If the exchange listing time is unavailable, the Lab does not guess. Every page (up to 2,000 candles) must be complete from the effective start; duplicates, gaps and malformed OHLCV invalidate the run. A successful response includes `strategyId`, `strategyName`, costs, candle count, gross and net statistics, sampled mark-to-market equity, monthly realized results and the last 100 trades. Errors return `{ ok: false, message }` and a non-2xx status; concurrent runs return 409.
+
+Signals use only prior closed bars. The simulator enters at the next open, models both legs' costs, checks a 1% stop before a 2% target on ambiguous bars, accounts for gaps through stops and closes at range end. Sizing uses fractional units capped at 1× simulated equity; funding, contract rounding, latency and Demo account risk checks are not simulated. Backtesting does not activate a strategy or place any order.
+
+## Legacy chat API (separate compatibility surface)
+
+The following legacy API details do not describe the default desk's strategy, risk, account, or execution path.
+They remain in the repository for compatibility and are restricted to the configured Delta Demo environment.
+The UI entry point does not load the legacy dashboard.
 
 ## Current Demo chat workflow
 

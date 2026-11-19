@@ -25,11 +25,11 @@ export const DEFAULT_RULES: Readonly<RiskRules> = Object.freeze({
   risk_per_trade_pct: 1.0,
   max_risk_per_trade_pct: 2.0,
   daily_drawdown_kill_pct: 4.0,
-  max_open_trades: 2,
+  max_open_trades: 1,
   min_rr: 2.0,
   min_confidence: 7,
   spread_limit_pct: 0.05,
-  leverage: 10,
+  leverage: 2,
   session_filter: false,
   allowed_sessions: ["ASIAN", "LONDON", "NEW_YORK", "OFF_HOURS"],
   cooldown_minutes: 30,
@@ -63,7 +63,7 @@ export function validateRules(r: RiskRules, maxLeverage: number): string[] {
   if (r.risk_per_trade_pct > r.max_risk_per_trade_pct) errors.push("Risk per trade cannot exceed the max risk per trade.");
   if (!(r.max_risk_per_trade_pct >= 0.5 && r.max_risk_per_trade_pct <= 2)) errors.push("Max risk per trade is capped at 2%.");
   if (!(r.daily_drawdown_kill_pct >= 1 && r.daily_drawdown_kill_pct <= 10)) errors.push("Daily drawdown kill must be between 1% and 10%.");
-  if (!(r.max_open_trades >= 1 && r.max_open_trades <= 10)) errors.push("Max open trades must be between 1 and 10.");
+  if (r.max_open_trades !== 1) errors.push("Only one open position is permitted.");
   if (!(r.min_rr >= 1)) errors.push("Minimum RR cannot be below 1:1.");
   if (!(r.min_confidence >= 1 && r.min_confidence <= 10)) errors.push("Minimum confidence must be between 1 and 10.");
   if (!(r.spread_limit_pct > 0 && r.spread_limit_pct <= 1)) errors.push("Spread limit must be between 0% and 1%.");

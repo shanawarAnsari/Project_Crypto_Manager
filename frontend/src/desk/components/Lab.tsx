@@ -1,7 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, dateTime, post, px, pnlClass, usd } from "../api";
-import { pushToast, useDesk } from "../store";
-import type { BacktestResult, JournalRow, TradeRow } from "../types";
+import { useDesk } from "../store";
+import type { HistoricalBacktest, JournalRow, LabCoverage, LabStrategy, TradeRow } from "../types";
+
+const utcDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+const utcStamp = (seconds: number) => new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
 
 function EquityCurve({ points }: { points: { time: number; equity: number }[] }) {
   if (points.length < 2) return null;
@@ -20,45 +23,105 @@ export function BacktestLab() {
   const instruments = useDesk((s) => s.instruments);
   const progress = useDesk((s) => s.backtestProgress);
   const [instrument, setInstrument] = useState("");
-  const [source, setSource] = useState<"synthetic" | "delta">("delta");
-  const [days, setDays] = useState(30);
+  const [catalog, setCatalog] = useState<LabStrategy[]>([]);
+  const [loadKey, reload] = useState(0);
+  const [catalogError, setCatalogError] = useState("");
+  const [strategyId, setStrategyId] = useState("");
+  const [start, setStart] = useState(() => utcDate(Date.now() - 30 * 86400000));
+  const [end, setEnd] = useState(() => utcDate(Date.now()));
+  const [resolution, setResolution] = useState("5m");
+  const [feeBps, setFeeBps] = useState("5.9"), [slippageBps, setSlippageBps] = useState("2");
+  const [spreadBps, setSpreadBps] = useState("1");
   const [busy, setBusy] = useState(false);
-  const [res, setRes] = useState<BacktestResult | null>(null);
-  const inst = instrument || instruments[0] || "BTCUSD";
+  const [error, setError] = useState("");
+  const ctl = useRef<AbortController | null>(null);
+  const [res, setRes] = useState<HistoricalBacktest | null>(null);
+  const inst = instrument || instruments[0] || "";
+  const [coverage, setCoverage] = useState<LabCoverage | null>(null);
+  const [coverageError, setCoverageError] = useState("");
+  const [coverageAttempt, retryCoverage] = useState(0);
+  const activeCoverage = coverage?.instrument === inst && coverage.resolution === resolution ? coverage : null;
+  const today = utcDate(Date.now()), min = activeCoverage ? utcDate(activeCoverage.earliestStart * 1000) : "";
+  useEffect(() => {
+    const abort = new AbortController();
+    setCatalogError("");
+    void api<{ strategies: LabStrategy[] }>("/api/strategies", { signal: abort.signal })
+      .then(({ strategies }) => { if (!abort.signal.aborted) setCatalog(strategies); })
+      .catch(() => { if (!abort.signal.aborted) setCatalogError("Strategy catalog unavailable."); });
+    return () => abort.abort();
+  }, [loadKey]);
+  useEffect(() => {
+    setCoverageError(""); setCoverage(null);
+    if (!inst) return;
+    const abort = new AbortController();
+    void api<LabCoverage>(`/api/lab/coverage?${new URLSearchParams({ instrument: inst, resolution })}`, { signal: abort.signal })
+      .then(data => {
+        if (abort.signal.aborted) return;
+        const floor = utcDate(data.earliestStart * 1000);
+        setStart(prev => prev && prev < floor ? floor : prev);
+        setCoverage(data);
+      }).catch(e => { if (!abort.signal.aborted) setCoverageError(e instanceof Error ? e.message : "Could not load listing time."); });
+    return () => abort.abort();
+  }, [inst, resolution, coverageAttempt]);
+  useEffect(() => () => ctl.current?.abort(), []);
 
   const run = async () => {
+    if (ctl.current) return;
+    const abort = new AbortController();
+    ctl.current = abort;
     setBusy(true);
-    const r = await post<{ ok: boolean; message?: string } & Partial<BacktestResult>>("/api/backtest", { instrument: inst, days, source, seed: 42 })
-      .catch(() => ({ ok: false, message: "Desk unreachable" }));
-    if (r.ok) setRes(r as BacktestResult);
-    else pushToast({ level: "error", title: "Backtest failed", message: r.message ?? "" });
-    setBusy(false);
+    setError(""); setRes(null);
+    try {
+      const r = await api<HistoricalBacktest & { ok: boolean; message?: string }>("/api/backtest", { method: "POST",
+        signal: abort.signal, body: JSON.stringify({ instrument: inst, strategyId, resolution,
+          start: Date.parse(start) / 1000, end: Date.parse(end) / 1000, feeBps: Number(feeBps), slippageBps: Number(slippageBps), spreadBps: Number(spreadBps) }) });
+      if (!r.ok) throw new Error(r.message || "Backtest failed.");
+      setRes(r);
+    } catch (e) { setError(abort.signal.aborted ? "Run canceled." : e instanceof Error ? e.message : "Desk unreachable."); }
+    finally { ctl.current = null; setBusy(false); }
   };
 
   return (
     <div className="space-y-4 p-4">
-      <div className="flex flex-wrap items-end gap-3">
+      <p className="text-sm">Replay verified public Delta India candles. A Lab run never selects a deployed strategy or places an order.</p>
+      <form className="flex flex-wrap items-end gap-3" onSubmit={(e) => { e.preventDefault(); void run(); }}>
         <label className="field"><span className="label">Instrument</span>
-          <select value={inst} onChange={(e) => setInstrument(e.target.value)}>{instruments.map((i) => <option key={i}>{i}</option>)}</select>
+          <select required disabled={busy} value={inst} onChange={(e) => setInstrument(e.target.value)}>{instruments.map((i) => <option key={i}>{i}</option>)}</select>
         </label>
-        <label className="field"><span className="label">History</span>
-          <select value={source} onChange={(e) => setSource(e.target.value as "synthetic" | "delta")}>
-            <option value="delta">Delta India (real 5M candles)</option>
-            <option value="synthetic">Synthetic (planted sweeps)</option>
+        <label className="field"><span className="label">Strategy candidate</span>
+          <select required disabled={busy} value={strategyId} onChange={e => setStrategyId(e.target.value)}>
+            <option value="">Select a candidate</option>
+            {catalog.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
           </select>
         </label>
-        <label className="field"><span className="label">Days</span>
-          <input type="number" min={source === "delta" ? 3 : 10} max={source === "delta" ? 60 : 180} value={days} onChange={(e) => setDays(Number(e.target.value))} />
+        <label className="field"><span className="label">Candle interval</span>
+          <select disabled={busy} value={resolution} onChange={e => setResolution(e.target.value)}>
+            {["5m", "15m", "1h", "4h", "1d"].map(v => <option key={v}>{v}</option>)}
+          </select>
         </label>
-        <button type="button" className="btn btn-primary" disabled={busy} onClick={() => void run()}>{busy ? `Running… ${Math.round(progress * 100)}%` : "Run backtest"}</button>
-        <p className="text-[11.5px] text-terminal-muted">Same Hunter, rule-based Analyst, AEGIS and paper engine as the live desk, using your current settings.</p>
-      </div>
+        <label className="field"><span className="label">From (UTC)</span><input type="date" disabled={busy} required min={min} max={end || today} value={start} onChange={e => setStart(e.target.value)} /></label>
+        <label className="field"><span className="label">Until (UTC, exclusive)</span><input type="date" disabled={busy} required min={start || min} max={today} value={end} onChange={e => setEnd(e.target.value)} /></label>
+        <label className="field"><span className="label">Fee + GST (bps / side)</span><input type="number" disabled={busy} required min="5.9" max="100" step="any" value={feeBps} onChange={e => setFeeBps(e.target.value)} /></label>
+        <label className="field"><span className="label">Slippage (bps / side)</span><input type="number" disabled={busy} required min="2" max="100" step="any" value={slippageBps} onChange={e => setSlippageBps(e.target.value)} /></label>
+        <label className="field"><span className="label">Bid/ask spread (bps)</span><input type="number" disabled={busy} required min="1" max="100" step="any" value={spreadBps} onChange={e => setSpreadBps(e.target.value)} /></label>
+        <button type="submit" className="btn btn-primary" disabled={busy || !activeCoverage || !strategyId || start >= end}>{busy ? `Running… ${Math.round(progress * 100)}%` : "Run backtest"}</button>
+        {busy && <button type="button" className="btn" onClick={() => ctl.current?.abort()}>Cancel</button>}
+      </form>
+      {catalogError && <p role="alert">{catalogError} <button type="button" className="btn" onClick={() => reload(k => k + 1)}>Retry</button></p>}
+      {coverageError && <p role="alert">{coverageError} <button type="button" className="btn" onClick={() => retryCoverage(k => k + 1)}>Retry listing lookup</button></p>}
+      {activeCoverage && <p className="text-sm">{inst} listed {utcStamp(activeCoverage.launchTime)}. Earliest eligible {resolution} candle: {utcStamp(activeCoverage.earliestStart)}. Later gaps still invalidate a run.</p>}
+      {error && <p role="alert" className="text-terminal-red">{error}</p>}
+      <p className="text-[11.5px] text-terminal-muted">Up to five years, subject to complete exchange coverage. Signals use closed candles; fills use the next open. One unlevered position, 1% stop, 2% target; stop first if both are hit.</p>
+      <p className="text-[11.5px] text-terminal-muted">Minimum fee: 5 bps taker + 18% GST = 5.9 bps per side. Each fill also pays estimated slippage and half the assumed bid/ask spread. Raise these assumptions for higher-cost markets; OHLCV does not contain historical quotes. 1 bp = 0.01%.</p>
       {res && (
         <>
+          <p><b>{res.strategyName}</b> · {res.instrument} · {res.resolution} · {utcStamp(res.start)} to {utcStamp(res.end)} (exclusive) · {res.candles.toLocaleString()} closed candles</p>
+          {res.requestedStart < res.start && <p className="text-sm">Requested start {utcStamp(res.requestedStart)} was moved to the first full post-listing interval.</p>}
+          <p className="text-sm">Gross P/L {usd(res.stats.gross_pnl)} − fees {usd(res.stats.fees)} ({res.feeBps} bps/side) − slippage {usd(res.stats.slippage)} ({res.slippageBps} bps/side) − spread {usd(res.stats.spread)} ({res.spreadBps} bps bid/ask) = net {usd(res.stats.net_pnl)}</p>
           <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-8">
             {([
               ["Net P/L", usd(res.stats.net_pnl), pnlClass(res.stats.net_pnl)], ["Return", `${res.stats.return_pct}%`, pnlClass(res.stats.return_pct)],
-              ["Trades", String(res.stats.trades), ""], ["Win rate", `${res.stats.win_rate}%`, ""], ["Profit factor", String(res.stats.profit_factor), ""],
+              ["Trades", String(res.stats.trades), ""], ["Win rate", `${res.stats.win_rate}%`, ""], ["Profit factor", res.stats.profit_factor === null ? "—" : String(res.stats.profit_factor), ""],
               ["Max DD", `${res.stats.max_drawdown_pct}%`, "text-terminal-red"], ["Avg win / loss", `${usd(res.stats.avg_win)} / ${usd(res.stats.avg_loss)}`, ""],
               ["Expectancy", usd(res.stats.expectancy), pnlClass(res.stats.expectancy)]
             ] as const).map(([k, v, c]) => <div key={k} className="kpi"><span className="label">{k}</span><b className={`num ${c || "text-terminal-text"}`}>{v}</b></div>)}
@@ -66,10 +129,9 @@ export function BacktestLab() {
           <EquityCurve points={res.equity_curve} />
           <div className="grid gap-4 md:grid-cols-3 text-[12px]">
             <div>
-              <p className="label mb-1">Decisions</p>
-              <p>{res.decisions.taken} taken · {res.decisions.vetoed} vetoed · {res.candles} candles · {res.elapsed_s}s</p>
-              <p className="label mb-1 mt-3">Veto reasons</p>
-              {Object.entries(res.veto_reasons).length ? Object.entries(res.veto_reasons).map(([k, v]) => <p key={k}>{k}: {v}</p>) : <p className="text-terminal-muted">None</p>}
+              <p className="label mb-1">Simulated equity</p>
+              <p>{usd(res.stats.starting_balance)} → {usd(res.stats.final_equity)}</p>
+              {!res.stats.trades && <p>No tradable signals in this window.</p>}
             </div>
             <div>
               <p className="label mb-1">Monthly</p>
@@ -94,15 +156,24 @@ export function Journal() {
   const [outcome, setOutcome] = useState("");
   const [data, setData] = useState<{ decisions: JournalRow[]; trades: TradeRow[]; reviews: { day: string; text: string }[] } | null>(null);
   const [open, setOpen] = useState<number | null>(null);
+  const [journalError, setJournalError] = useState("");
   useEffect(() => {
-    void api<NonNullable<typeof data>>(`/api/journal?limit=150${outcome ? `&outcome=${outcome}` : ""}`).then(setData).catch(() => undefined);
+    let active = true;
+    setJournalError("");
+    void api<NonNullable<typeof data>>(`/api/journal?limit=150${outcome ? `&outcome=${outcome}` : ""}`)
+      .then(result => { if (active) setData(result); })
+      .catch((e: unknown) => { if (active) setJournalError(e instanceof Error ? e.message : String(e)); });
+    return () => { active = false; };
   }, [tick, outcome]);
   const review = async () => {
-    const r = await post<{ ok: boolean; text: string }>("/api/review");
-    if (r.ok) setData((d) => (d ? { ...d, reviews: [{ day: "today", text: r.text }, ...d.reviews] } : d));
+    try {
+      const r = await post<{ ok: boolean; text: string }>("/api/review");
+      if (r.ok) setData((d) => (d ? { ...d, reviews: [{ day: "today", text: r.text }, ...d.reviews] } : d));
+    } catch (e) { setJournalError(e instanceof Error ? e.message : String(e)); }
   };
   return (
     <div className="grid gap-4 p-4 xl:grid-cols-2">
+      {journalError && <p role="alert" className="text-terminal-red">{journalError}</p>}
       <div>
         <div className="mb-2 flex items-center gap-2">
           <p className="label">Decisions</p>

@@ -1,22 +1,24 @@
 import { useSyncExternalStore } from "react";
 import { api } from "./api";
 import type {
-  AccountState, AgentResult, Candle, CycleSummary, DeltaHealth, ExecLogRow, Kpis, Params, Position, Quotes, Rules, SessionInfo, Toast
+  AccountState, AgentResult, Candle, CycleSummary, DeltaHealth, ExchangePosition, ExecLogRow, Kpis, Params, Quotes, Rules, SessionInfo, Toast
 } from "./types";
 
 export interface DeskState {
   connected: boolean;
   loaded: boolean;
   mode: string;
-  dataSource: "demo" | "delta";
-  execution: "paper" | "delta";
+  dataSource: "delta";
+  execution: "disabled" | "delta";
+  strategyId: string | null;
+  executionPermitted: boolean;
   banner: string | null;
   analystMode: string;
   model: string;
   instruments: string[];
   instrument: string;
   kpis: Kpis | null;
-  positions: Position[];
+  positions: ExchangePosition[];
   equity: { time: number; equity: number }[];
   session: SessionInfo | null;
   rules: Rules | null;
@@ -26,7 +28,6 @@ export interface DeskState {
   quotes: Quotes;
   deltaEnv: "testnet" | "production";
   maxLeverage: number;
-  confirmPhrase: string;
   paused: boolean;
   lastCycle: Record<string, CycleSummary>;
   agentStatus: Record<string, AgentResult>;
@@ -41,9 +42,9 @@ export interface DeskState {
 }
 
 let state: DeskState = {
-  connected: false, loaded: false, mode: "DEMO", dataSource: "demo", execution: "paper", banner: null, analystMode: "rules", model: "",
+  connected: false, loaded: false, mode: "DISCONNECTED", dataSource: "delta", execution: "disabled", strategyId: null, executionPermitted: false, banner: null, analystMode: "catalog", model: "",
   instruments: [], instrument: "BTCUSD", kpis: null, positions: [], equity: [], session: null, rules: null, params: null, delta: null,
-  deltaEnv: "testnet", maxLeverage: 25, confirmPhrase: "", paused: false, lastCycle: {}, agentStatus: {}, feed: [], candles: {},
+  deltaEnv: "testnet", maxLeverage: 2, paused: true, lastCycle: {}, agentStatus: {}, feed: [], candles: {},
   execLog: [], toasts: [], journalTick: 0, backtestProgress: 0, digits: {}, account: null, quotes: {}, candleHistoryLoaded: {}
 };
 const listeners = new Set<() => void>();
@@ -82,9 +83,9 @@ export async function loadState(): Promise<void> {
     loaded: true, mode: d.mode as string, dataSource: d.data_source as DeskState["dataSource"], execution: d.execution as DeskState["execution"],
     banner: (d.banner as string | null) ?? null, analystMode: d.analyst_mode as string, model: d.model as string, instruments,
     instrument: instruments.includes(s.instrument) ? s.instrument : instruments[0] ?? "BTCUSD",
-    kpis: d.kpis as Kpis, positions: d.positions as Position[], equity: d.equity_curve as DeskState["equity"], session: d.session as SessionInfo,
+    kpis: d.kpis as Kpis, positions: d.positions as ExchangePosition[], equity: d.equity_curve as DeskState["equity"], session: d.session as SessionInfo,
     rules: d.rules as Rules, params: d.params as Params, delta: d.delta as DeltaHealth, deltaEnv: d.delta_env as DeskState["deltaEnv"],
-    maxLeverage: d.max_leverage as number, confirmPhrase: d.confirm_phrase as string, paused: Boolean(d.paused),
+    maxLeverage: d.max_leverage as number, strategyId: typeof d.strategy_id === "string" ? d.strategy_id : null, executionPermitted: d.execution_permitted === true, paused: Boolean(d.paused),
     lastCycle: d.last_cycle as Record<string, CycleSummary>,
     account: d.account as AccountState, quotes: d.quotes as Quotes,
     digits: Object.fromEntries(Object.entries(specs).map(([k, v]) => [k, v.digits]))
@@ -130,7 +131,7 @@ interface FrameData {
   quotes: Quotes;
   candles: Record<string, Candle>;
   kpis: Kpis;
-  positions: Position[];
+  positions: ExchangePosition[];
   session: SessionInfo;
   mode: string;
   equity_point?: { time: number; equity: number };
@@ -157,9 +158,7 @@ export function handleFrame(msg: Frame): void {
     case "cycle_end": {
       const c = msg.data as CycleSummary;
       setState((s) => {
-        const prev = s.lastCycle[c.instrument];
-        const lastCycle = c.setup || !prev ? { ...s.lastCycle, [c.instrument]: c } : { ...s.lastCycle, [c.instrument]: { ...prev, levels: c.levels } };
-        return { lastCycle, journalTick: c.setup ? s.journalTick + 1 : s.journalTick };
+        return { lastCycle: { ...s.lastCycle, [c.instrument]: c }, journalTick: c.outcome !== "none" ? s.journalTick + 1 : s.journalTick };
       });
       break;
     }

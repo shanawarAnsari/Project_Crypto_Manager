@@ -122,7 +122,7 @@ export function DeltaFills() {
                 <td className={f.side === "buy" ? "text-profit" : "text-loss"}>{f.side.toUpperCase()}</td>
                 <td className="num text-right text-slate-300">{f.size}</td>
                 <td className="num text-right text-slate-300">{px(f.price)}</td>
-                <td className="num text-right text-slate-400">{usd(f.commission)}</td>
+                <td className="num text-right text-slate-400">{f.commission === null ? "—" : usd(f.commission)}</td>
               </tr>
             ))}
           </tbody>

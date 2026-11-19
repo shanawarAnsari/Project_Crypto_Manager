@@ -2,8 +2,8 @@ export type AgentStatus = "ok" | "skip" | "veto" | "error";
 export type Direction = "LONG" | "SHORT";
 export type Bias = "BULLISH_SWEEP_LONG" | "BEARISH_SWEEP_SHORT" | "NO_TRADE";
 export type Outcome = "none" | "skipped" | "vetoed" | "taken" | "error";
-export type DataSource = "demo" | "delta";
-export type ExecutionVenue = "paper" | "delta";
+export type DataSource = "delta";
+export type ExecutionVenue = "delta";
 
 /** 5-minute OHLCV bar; `time` is the bar open in unix seconds (UTC). */
 export interface Bar {
@@ -78,31 +78,6 @@ export interface Check {
   name: string;
   passed: boolean;
   detail: string;
-}
-
-/** A paper or Delta position as shown in the UI. Volume is in exchange contracts. */
-export interface Position {
-  id: string;
-  signal_id: string;
-  instrument: string;
-  direction: Direction;
-  volume: number;
-  initial_volume: number;
-  entry_price: number;
-  stop_loss: number;
-  initial_stop: number;
-  take_profit_1: number;
-  take_profit_2: number;
-  opened_at: number;
-  status: "open" | "closed";
-  closed_at: number | null;
-  exit_price: number | null;
-  realized_pnl: number;
-  unrealized_pnl: number;
-  tp1_hit: boolean;
-  breakeven: boolean;
-  venue: ExecutionVenue;
-  close_reason: string | null;
 }
 
 export interface CycleSummary {

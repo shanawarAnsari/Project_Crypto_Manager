@@ -112,37 +112,3 @@ export function swingPoints(bars: readonly Bar[], left = 2, right = 2): { highs:
   return { highs, lows };
 }
 
-/** Seeded PRNG (mulberry32) with a Gaussian helper so demo data and backtests are reproducible. */
-export class Rng {
-  private state: number;
-  private spare: number | null = null;
-  constructor(seed: number) {
-    this.state = seed >>> 0;
-  }
-  random(): number {
-    this.state = (this.state + 0x6d2b79f5) >>> 0;
-    let t = this.state;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  }
-  uniform(a: number, b: number): number {
-    return a + (b - a) * this.random();
-  }
-  int(a: number, b: number): number {
-    return a + Math.floor(this.random() * (b - a + 1));
-  }
-  gauss(mu: number, sigma: number): number {
-    if (this.spare !== null) {
-      const s = this.spare;
-      this.spare = null;
-      return mu + sigma * s;
-    }
-    let u = 0;
-    while (u === 0) u = this.random();
-    const v = this.random();
-    const r = Math.sqrt(-2 * Math.log(u));
-    this.spare = r * Math.sin(2 * Math.PI * v);
-    return mu + sigma * r * Math.cos(2 * Math.PI * v);
-  }
-}

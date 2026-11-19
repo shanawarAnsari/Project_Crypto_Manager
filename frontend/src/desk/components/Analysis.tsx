@@ -35,15 +35,14 @@ export function WhyThisTrade() {
   const cycle = useDesk((s) => s.lastCycle[s.instrument]);
   const mult = useDesk((s) => s.params?.displacement_mult ?? 1.2);
   const digits = useDesk((s) => s.digits[s.instrument] ?? 2);
-  const dataSource = useDesk((s) => s.dataSource);
+  const strategy = useDesk((s) => s.strategyId);
 
   if (!cycle?.setup) {
     return (
       <section className="panel h-full">
         <header className="panel-head"><h2 className="panel-title">Why this trade? · {instrument}</h2></header>
         <div className="p-4 text-sm text-terminal-muted">
-          <p className="flex items-center gap-2"><i className="h-2 w-2 animate-pulse rounded-full bg-sky-400" />The Hunter is scanning every 5M close for a liquidity sweep.</p>
-          {dataSource === "demo" && <p className="mt-2">Press <b className="text-terminal-text">Run Demo Scenario</b> to watch one play out in ~30 seconds.</p>}
+          <p>{strategy ? `Waiting for a closed-candle signal from ${strategy}.` : "No strategy selected. Test a candidate in Backtest, then select it in Settings."}</p>
         </div>
       </section>
     );
@@ -110,13 +109,29 @@ export function WhyThisTrade() {
   );
 }
 
+export function SignalDetails() {
+  const instrument = useDesk(s => s.instrument);
+  const selected = useDesk(s => s.strategyId);
+  const cycle = useDesk(s => s.lastCycle[instrument]);
+  return <section className="panel">
+    <header className="panel-head"><h2 className="panel-title">Latest decision · {instrument}</h2></header>
+    <div className="space-y-3 p-4 text-sm">
+      <p>Selected strategy: <b>{selected ?? "None"}</b></p>
+      {cycle ? <>
+        <p>{time(cycle.ts)} · {cycle.outcome}</p>
+        <ul>{cycle.trace.map((row, i) => <li key={i}><b>{row.agent}:</b> {row.summary}</li>)}</ul>
+      </> : <p className="text-terminal-muted">Select a strategy in Settings. Decisions appear after the scanner evaluates a closed five-minute candle.</p>}
+    </div>
+  </section>;
+}
+
 export function Pipeline() {
   const instrument = useDesk((s) => s.instrument);
   const status = useDesk((s) => s.agentStatus);
   return (
     <section className="panel">
       <header className="panel-head"><h2 className="panel-title">Agent pipeline · {instrument}</h2><span className="text-[11px] text-terminal-muted">runs on every 5M close</span></header>
-      <ol className="grid grid-cols-1 gap-2 p-3 sm:grid-cols-2 xl:grid-cols-7">
+      <ol className="grid grid-cols-1 gap-2 p-3 sm:grid-cols-2 xl:grid-cols-4">
         {AGENTS.map((a, i) => {
           const r = status[`${instrument}:${a.name}`];
           return (
@@ -138,7 +153,7 @@ export function Pipeline() {
 
 export function AgentFeed() {
   const feed = useDesk((s) => s.feed);
-  const rows = feed.filter((r) => r.status !== "skip" || r.agent === "Hunter").slice(0, 60);
+  const rows = feed.slice(0, 60);
   return (
     <section className="panel flex h-full flex-col">
       <header className="panel-head"><h2 className="panel-title">Live agent feed</h2><span className="text-[11px] text-terminal-muted">{feed.length} events</span></header>

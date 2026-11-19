@@ -13,12 +13,12 @@ describe("desk stream reducer", () => {
   beforeEach(() => setState({ lastCycle: {}, candles: {}, journalTick: 0 }));
   afterEach(() => vi.unstubAllGlobals());
 
-  it("keeps the last setup on screen while refreshing liquidity levels from quiet cycles", () => {
+  it("shows the latest cycle rather than representing an old setup as current", () => {
     handleFrame({ type: "cycle_end", data: cycle("a", true), ts: 1 });
     handleFrame({ type: "cycle_end", data: cycle("b", false, 3), ts: 2 });
     const kept = getState().lastCycle.BTCUSD!;
-    expect(kept.cycle_id).toBe("a");
-    expect(kept.setup).not.toBeNull();
+    expect(kept.cycle_id).toBe("b");
+    expect(kept.setup).toBeNull();
     expect(kept.levels).toHaveLength(3);
     expect(getState().journalTick).toBe(1);
   });
@@ -46,8 +46,8 @@ describe("desk stream reducer", () => {
     expect(getState().candles.BTCUSD).toEqual([candle]);
   });
 
-  it("updates exchange account values even when order execution is paper", () => {
-    setState({ execution: "paper", account: null });
+  it("updates exchange account values even when order execution is disabled", () => {
+    setState({ execution: "disabled", account: null });
     const account = { environment: "testnet", wallet: { balance: 123, available: 100, asset: "USD" }, equity: 123, positions: [], updated_at: 10, error: null };
     handleFrame({ type: "delta_sync", ts: 10, data: { account, positions: [] } });
     expect(getState().account).toEqual(account);

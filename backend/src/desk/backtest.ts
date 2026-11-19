@@ -1,148 +1,98 @@
-/** Backtest Lab: replays history through the same Hunter + Analyst (rule-based) + Guardian + paper engine rules. */
 import { setImmediate as yieldToLoop } from "node:timers/promises";
-import { mockDecision } from "./analyst.js";
-import { DemoMarket } from "./demo-feed.js";
-import { specFor } from "./market.js";
-import { PaperEngine, round2 } from "./paper-engine.js";
-import { evaluate, newGuardianState, type RiskRules } from "./risk.js";
-import { detectAt, mapLiquidity, type StrategyParams } from "./strategy.js";
-import type { Bar, LiquidityLevel } from "./types.js";
+import { evaluateCandidate, strategyById } from "./catalog.js";
+import { bracketPrices, MIN_FEE_BPS, MIN_SLIPPAGE_BPS } from "./candidate-policy.js";
+import { HistoryError, intervals, type HistoryRange } from "./history.js";
+import type { Bar } from "./types.js";
 
-export interface BacktestResult {
-  instrument: string;
-  source: "synthetic" | "delta";
-  days: number;
-  candles: number;
-  elapsed_s: number;
-  stats: {
-    trades: number; win_rate: number; profit_factor: number; max_drawdown_pct: number; net_pnl: number; return_pct: number;
-    avg_win: number; avg_loss: number; expectancy: number; final_equity: number; starting_balance: number;
-  };
-  decisions: { taken: number; vetoed: number };
-  veto_reasons: Record<string, number>;
-  equity_curve: Array<{ time: number; equity: number }>;
-  markers: Array<{ time: number; type: "entry" | "exit"; direction?: string; price?: number; pnl?: number; reason?: string | null; level?: string }>;
-  monthly: Array<{ month: string; pnl: number; pct: number }>;
-  trades: Array<{ time: number; closed: number; direction: string; entry: number; exit: number | null; pnl: number; reason: string | null }>;
-  disclaimer: string;
-}
+export interface LabRequest extends HistoryRange { strategyId: string; feeBps: number; slippageBps: number; spreadBps: number }
+export const MIN_SPREAD_BPS = 1;
+interface Position { time: number; side: 1 | -1; raw: number; entry: number; units: number; stop: number; target: number }
+interface Fill { time: number; closed: number; direction: string; entry: number; exit: number; pnl: number; reason: string }
+const round = (n: number) => Math.round(n * 100) / 100;
 
-export async function runBacktest(opts: {
-  instrument: string;
-  days: number;
-  rules: RiskRules;
-  params: StrategyParams;
-  startingBalance: number;
-  candles?: Bar[];
-  seed?: number;
-  typicalSpreadPct?: number;
-  progress?: (x: number) => void;
-}): Promise<BacktestResult> {
-  const t0 = Date.now();
-  const { instrument, rules, params } = opts;
-  const bars = opts.candles ?? new DemoMarket(instrument, { seed: opts.seed ?? 42, historyDays: opts.days, maxCandles: opts.days * 288 + 2000 }).candles;
-  const n = bars.length;
-  const spec = specFor(instrument);
-  const engine = new PaperEngine(opts.startingBalance, bars[0]?.time ?? 0);
-  engine.equityCurve = [];
-  const gs = newGuardianState();
-  gs.day_start_equity = opts.startingBalance;
-  let levels: LiquidityLevel[] = [];
-  const markers: BacktestResult["markers"] = [];
-  const decisions = { taken: 0, vetoed: 0 };
-  const vetoReasons: Record<string, number> = {};
-  const curve: Array<{ time: number; equity: number }> = [];
-  const startI = 300;
+/** Replays validated contiguous public candles. Simulation only: no exchange or account dependencies. */
+export async function runBacktest(opts: LabRequest, bars: readonly Bar[], startingBalance: number,
+  progress?: (fraction: number) => void, signal?: AbortSignal) {
+  const strategy = strategyById(opts.strategyId);
+  if (!strategy) throw new HistoryError("Select a catalog strategy.", 400);
+  if (bars.length < strategy.lookback + 2) throw new HistoryError("Not enough candles for this strategy's lookback plus a fill.", 422);
+  if (!(Number.isFinite(startingBalance) && startingBalance > 0) ||
+      ![opts.feeBps, opts.slippageBps, opts.spreadBps].every(x => Number.isFinite(x) && x <= 100) ||
+      opts.feeBps < MIN_FEE_BPS || opts.slippageBps < MIN_SLIPPAGE_BPS || opts.spreadBps < MIN_SPREAD_BPS)
+    throw new HistoryError("Invalid simulation balance or costs.", 400);
+  const t0 = Date.now(), fee = opts.feeBps / 10000, slip = opts.slippageBps / 10000, halfSpread = opts.spreadBps / 20000;
+  const curve = [{ time: opts.start, equity: startingBalance }], recent: Fill[] = [];
+  const monthPnls = new Map<string, number>();
+  const stride = Math.ceil(bars.length / 700), step = intervals[opts.resolution];
+  let equity = startingBalance, peak = equity, maxDD = 0, gross = 0, fees = 0, slippage = 0, spread = 0;
+  let count = 0, wins = 0, losses = 0, gain = 0, loss = 0, pos: Position | undefined;
 
-  for (let i = startI; i < n; i += 1) {
-    const c = bars[i]!;
-    const day = new Date(c.time * 1000).toISOString().slice(0, 10);
-    if (day !== gs.day_key) {
-      gs.day_key = day;
-      gs.day_start_equity = engine.equity();
-    }
-    for (const ev of engine.onCandle(instrument, c)) {
-      if (ev.type === "sl" || ev.type === "stop" || ev.type === "tp2") {
-        markers.push({ time: ev.position.closed_at ?? c.time, type: "exit", pnl: ev.position.realized_pnl, reason: ev.position.close_reason });
-      }
-    }
-    if (i % 24 === 0 || !levels.length) levels = mapLiquidity(bars.slice(Math.max(0, i - 600), i - params.confirm_candles), params);
-    for (const setup of detectAt(bars, i, levels, instrument, params)) {
-      const dec = mockDecision(setup, params);
-      const { checks, contracts } = evaluate(rules, gs, {
-        instrument, direction: setup.direction, entry: setup.entry_price, stop: setup.stop_loss, tp1: setup.take_profit_1,
-        confidence: dec.confidence_score, session: setup.session, spreadPct: opts.typicalSpreadPct ?? 0.01, equity: engine.equity(),
-        availableMargin: engine.equity() - engine.usedMargin(rules.leverage), openTrades: engine.positions.size,
-        instrumentHasPosition: false, signalId: setup.signal_id, levelKey: `${instrument}:${setup.level.name}`,
-        candleHourUtc: new Date(c.time * 1000).getUTCHours(), analystBias: dec.bias, spec, now: c.time
-      });
-      gs.processed_ids.add(setup.signal_id);
-      const failed = checks.filter((ch) => !ch.passed);
-      if (failed.length) {
-        decisions.vetoed += 1;
-        for (const ch of failed) vetoReasons[ch.name] = (vetoReasons[ch.name] ?? 0) + 1;
-        continue;
-      }
-      gs.recent_signals.set(`${instrument}:${setup.level.name}`, c.time);
-      engine.open({ signalId: setup.signal_id, instrument, direction: setup.direction, volume: contracts, price: setup.entry_price, sl: setup.stop_loss, tp1: setup.take_profit_1, tp2: setup.take_profit_2, ts: c.time });
-      decisions.taken += 1;
-      markers.push({ time: c.time, type: "entry", direction: setup.direction, price: setup.entry_price, level: setup.level.name });
-    }
-    if (i % 12 === 0) curve.push({ time: c.time, equity: engine.equity() });
-    if (i % 500 === 0) {
-      opts.progress?.((i - startI) / Math.max(1, n - startI));
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i]!;
+    if (i % 2048 === 0) {
       await yieldToLoop();
+      signal?.throwIfAborted();
+      progress?.(i / bars.length);
     }
+    if (!pos && equity > 0 && i > 0) {
+      const direction = evaluateCandidate(strategy.id, bars, i); // Only bars before this open.
+      if (direction) {
+        const side = direction === "long" ? 1 : -1;
+        const entry = b.open * (1 + side * (slip + halfSpread));
+        // Fractional research units: at most 1x equity, with entry fee reserved.
+        const units = equity / (entry * (1 + fee));
+        pos = { time: b.time, side, raw: b.open, entry, units, ...bracketPrices(entry, direction) };
+      }
+    }
+    if (pos) {
+      const { side, stop, target, units, entry } = pos;
+      const long = side === 1;
+      let raw: number | undefined, reason = "";
+      if (long ? b.open <= stop : b.open >= stop) { raw = b.open; reason = "Gap through stop"; }
+      else if (long ? b.open >= target : b.open <= target) { raw = target; reason = "Target"; }
+      else if (long ? b.low <= stop : b.high >= stop) { raw = stop; reason = "Stop"; } // Adverse ordering on ambiguous bars.
+      else if (long ? b.high >= target : b.low <= target) { raw = target; reason = "Target"; }
+      else if (i === bars.length - 1) { raw = b.close; reason = "End of range"; }
+      if (raw !== undefined) {
+        const exit = raw * (1 - side * (slip + halfSpread)), tradeFees = units * (entry + exit) * fee;
+        const pnl = side * units * (exit - entry) - tradeFees;
+        gross += side * units * (raw - pos.raw);
+        fees += tradeFees;
+        slippage += units * (pos.raw + raw) * slip;
+        spread += units * (pos.raw + raw) * halfSpread;
+        equity += pnl;
+        count++;
+        if (pnl > 0) { wins++; gain += pnl; }
+        else if (pnl < 0) { losses++; loss -= pnl; }
+        const month = new Date(b.time * 1000).toISOString().slice(0, 7);
+        monthPnls.set(month, (monthPnls.get(month) ?? 0) + pnl);
+        recent.push({ time: pos.time, closed: b.time, direction: long ? "long" : "short", entry, exit, pnl: round(pnl), reason });
+        if (recent.length > 100) recent.shift();
+        pos = undefined;
+      }
+    }
+    const marked = pos ? equity + pos.side * pos.units * (b.close - pos.entry) - pos.units * pos.entry * fee : equity;
+    peak = Math.max(peak, marked);
+    maxDD = Math.max(maxDD, (peak - marked) / peak * 100);
+    if ((i + 1) % stride === 0 || i === bars.length - 1) curve.push({ time: b.time + step, equity: round(marked) });
   }
-  const last = bars.at(-1);
-  if (last) {
-    engine.closeAll({ [instrument]: last.close }, "End of test", last.time);
-    curve.push({ time: last.time, equity: engine.equity() });
-  }
-
-  const trades = engine.closed;
-  const pnls = trades.map((t) => t.realized_pnl);
-  const winsArr = pnls.filter((p) => p > 0);
-  const lossArr = pnls.filter((p) => p < 0);
-  const grossWin = winsArr.reduce((s, p) => s + p, 0);
-  const grossLoss = -lossArr.reduce((s, p) => s + p, 0);
-  let peak = opts.startingBalance;
-  let maxDd = 0;
-  for (const pt of curve) {
-    peak = Math.max(peak, pt.equity);
-    if (peak) maxDd = Math.max(maxDd, (peak - pt.equity) / peak * 100);
-  }
-  const monthlyMap = new Map<string, number>();
-  for (const t of trades) {
-    const key = new Date((t.closed_at ?? t.opened_at) * 1000).toISOString().slice(0, 7);
-    monthlyMap.set(key, (monthlyMap.get(key) ?? 0) + t.realized_pnl);
-  }
-  let eq = opts.startingBalance;
-  const monthly = [...monthlyMap.keys()].sort().map((k) => {
-    const pnl = monthlyMap.get(k)!;
-    const row = { month: k, pnl: round2(pnl), pct: round2(pnl / eq * 100) };
-    eq += pnl;
-    return row;
+  let balance = startingBalance;
+  const monthly = [...monthPnls].map(([month, pnl]) => {
+    const pct = round(pnl / balance * 100);
+    balance += pnl;
+    return { month, pnl: round(pnl), pct };
   });
-  const final = engine.equity();
-  opts.progress?.(1);
+  progress?.(1);
   return {
-    instrument, source: opts.candles ? "delta" : "synthetic", days: opts.days, candles: n, elapsed_s: round2((Date.now() - t0) / 1000),
-    stats: {
-      trades: trades.length,
-      win_rate: pnls.length ? Math.round(winsArr.length / pnls.length * 1000) / 10 : 0,
-      profit_factor: grossLoss ? round2(grossWin / grossLoss) : round2(grossWin),
-      max_drawdown_pct: round2(maxDd),
-      net_pnl: round2(final - opts.startingBalance),
-      return_pct: round2((final - opts.startingBalance) / opts.startingBalance * 100),
-      avg_win: round2(grossWin / Math.max(1, winsArr.length)),
-      avg_loss: round2(-grossLoss / Math.max(1, lossArr.length)),
-      expectancy: pnls.length ? round2(pnls.reduce((s, p) => s + p, 0) / pnls.length) : 0,
-      final_equity: round2(final),
-      starting_balance: opts.startingBalance
-    },
-    decisions, veto_reasons: vetoReasons, equity_curve: curve, markers, monthly,
-    trades: trades.map((t) => ({ time: t.opened_at, closed: t.closed_at ?? 0, direction: t.direction, entry: t.entry_price, exit: t.exit_price, pnl: t.realized_pnl, reason: t.close_reason })),
-    disclaimer: "Backtests on synthetic or historical data do not guarantee future results."
+    ...opts, strategyName: strategy.name, source: "delta" as const, days: (opts.end - opts.start) / 86400,
+    candles: bars.length, elapsed_s: round((Date.now() - t0) / 1000),
+    stats: { trades: count, win_rate: count ? round(100 * wins / count) : 0, profit_factor: loss ? round(gain / loss) : null,
+      max_drawdown_pct: round(maxDD), net_pnl: round(equity - startingBalance), return_pct: round((equity / startingBalance - 1) * 100),
+      avg_win: wins ? round(gain / wins) : 0, avg_loss: losses ? round(-loss / losses) : 0,
+      expectancy: count ? round((equity - startingBalance) / count) : 0, final_equity: round(equity), starting_balance: startingBalance,
+      gross_pnl: round(gross), fees: round(fees), slippage: round(slippage), spread: round(spread) },
+    decisions: { taken: count, vetoed: 0 }, veto_reasons: {}, equity_curve: curve, trades: recent, monthly,
+    disclaimer: "Research simulation, not an order or evidence of future profit. Costs are estimates. Funding, order-book liquidity, contract rounding, latency and account risk filters are not modeled."
   };
 }
+export type BacktestResult = Awaited<ReturnType<typeof runBacktest>>;

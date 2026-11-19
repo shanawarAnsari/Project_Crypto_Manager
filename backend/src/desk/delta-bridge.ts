@@ -1,6 +1,6 @@
 /**
  * Delta Exchange India bridge for the desk: market data, account sync, bracket orders and position management.
- * Hosts are pinned to Delta India (testnet = Demo account, production = real money).
+ * Desk requests are pinned to the India demo endpoint; redirects are forbidden.
  */
 import { createHash } from "node:crypto";
 import { deltaEndpointsByEnvironment, type DeltaEnvironment } from "../exchange/delta-client.js";
@@ -8,7 +8,6 @@ import { createDeltaSignature } from "../exchange/signing.js";
 import { digitsForTick, FIVE_MIN, roundTo, specFor } from "./market.js";
 import type { Bar, Direction } from "./types.js";
 
-export const CONFIRM_PHRASE = "I UNDERSTAND THE RISK";
 
 export interface DeltaIssue {
   code: string;
@@ -26,7 +25,7 @@ export interface DeltaHealth {
   ping_ms: number | null;
   live_unlocked: boolean;
   allow_live_env: boolean;
-  account: { balance: number; available: number; equity: number; asset: string } | null;
+  account: { balance: number; available: number; equity: null; asset: string } | null;
   products: Record<string, { id: number; live: boolean; contract_value: number; tick_size: number; max_leverage: number }>;
 }
 
@@ -46,8 +45,8 @@ export interface DeltaFill {
   side: "buy" | "sell";
   size: number;
   price: number;
-  commission: number;
-  notional: number;
+  commission: number | null;
+  notional: number | null;
   order_id: string | null;
   role: string;
   time: number;
@@ -79,7 +78,7 @@ export interface DeltaBridgeConfig {
   apiKey: string;
   apiSecret: string;
   environment: DeltaEnvironment;
-  liveTradingConfirmed: boolean;
+  maySubmit?: () => boolean;
 }
 
 export class DeltaRequestError extends Error {
@@ -89,21 +88,25 @@ export class DeltaRequestError extends Error {
   }
 }
 
+function numeric(raw: unknown) {
+  return typeof raw === "number" || (typeof raw === "string" && raw.trim() !== "") ? Number(raw) : NaN;
+}
+
 export class DeltaBridge {
-  liveUnlocked = false;
   lastHealth: DeltaHealth;
   private readonly baseUrl: string;
-  private readonly products = new Map<string, { id: number; live: boolean; maxLeverage: number; fetchedAt: number }>();
+  private readonly products = new Map<string, { id: number; live: boolean; maxLeverage: number; feeBps: number; fetchedAt: number }>();
 
   constructor(
     private readonly cfg: DeltaBridgeConfig,
     private readonly onLog: (row: ExecLogRow) => void = () => undefined,
     private readonly fetcher: typeof fetch = fetch
   ) {
-    this.baseUrl = deltaEndpointsByEnvironment[cfg.environment].rest;
+    if (cfg.environment !== "testnet") throw new Error("Desk accepts only the Delta India testnet.");
+    this.baseUrl = deltaEndpointsByEnvironment.testnet.rest;
     this.lastHealth = {
       available: true, connected: false, authenticated: false, environment: cfg.environment, issues: [], checked_at: 0, ping_ms: null,
-      live_unlocked: false, allow_live_env: this.allowLiveEnv, account: null, products: {}
+      live_unlocked: false, allow_live_env: false, account: null, products: {}
     };
   }
 
@@ -115,23 +118,18 @@ export class DeltaBridge {
     return Boolean(this.cfg.apiKey && this.cfg.apiSecret);
   }
 
-  get allowLiveEnv(): boolean {
-    return this.cfg.environment === "production" && this.cfg.liveTradingConfirmed;
-  }
-
-  accountLabel(): "DEMO" | "LIVE" {
-    return this.cfg.environment === "testnet" ? "DEMO" : "LIVE";
-  }
-
-  /** True when orders may be sent: credentials present, API healthy and (for production) live explicitly unlocked. */
   isReady(): boolean {
-    if (!this.hasCredentials || !this.lastHealth.authenticated) return false;
-    return this.cfg.environment === "testnet" || (this.allowLiveEnv && this.liveUnlocked);
+    const h = this.lastHealth;
+    return this.cfg.environment === "testnet" && this.hasCredentials && h.connected && h.authenticated &&
+      !h.issues.length && Date.now() / 1000 - h.checked_at >= 0 && Date.now() / 1000 - h.checked_at <= 30;
   }
 
   // ------------------------------------------------------------------ HTTP
   private async request<T = unknown>(path: string, opts: { method?: "GET" | "POST" | "PUT" | "DELETE"; auth?: boolean; body?: Record<string, unknown> } = {}): Promise<T> {
     const method = opts.method ?? "GET";
+    if (method !== "GET" && (path !== "/v2/orders" || method !== "POST" || !opts.auth || !this.isReady() || !this.cfg.maySubmit?.())) {
+      throw new DeltaRequestError("Demo execution not authorized", 403);
+    }
     const body = opts.body ? JSON.stringify(opts.body) : "";
     const headers: Record<string, string> = { accept: "application/json", "user-agent": "crypto-manager-desk" };
     if (body) headers["content-type"] = "application/json";
@@ -144,7 +142,7 @@ export class DeltaBridge {
     }
     let res: Response;
     try {
-      res = await this.fetcher(`${this.baseUrl}${path}`, { method, headers, ...(body ? { body } : {}), signal: AbortSignal.timeout(10_000) });
+      res = await this.fetcher(`${this.baseUrl}${path}`, { method, redirect: "error", headers, ...(body ? { body } : {}), signal: AbortSignal.timeout(10_000) });
     } catch {
       throw new DeltaRequestError("Delta India API is unreachable", 0);
     }
@@ -159,13 +157,13 @@ export class DeltaBridge {
       const code = json?.error?.code;
       throw new DeltaRequestError(`Delta India rejected the request (HTTP ${res.status}${code ? `, ${code}` : ""})`, res.status, code, json?.error?.context);
     }
-    if (!json) throw new DeltaRequestError("Delta India returned invalid JSON", res.status);
-    return (json.result ?? json) as T;
+    if (json?.success !== true || json.result == null) throw new DeltaRequestError("Invalid Delta response envelope", res.status);
+    return json.result as T;
   }
 
   // ------------------------------------------------------------------ market data
   /** Load product metadata and refresh the shared instrument spec (contract value, tick size, product id). */
-  async loadProduct(symbol: string, force = false): Promise<{ id: number; live: boolean; maxLeverage: number }> {
+  async loadProduct(symbol: string, force = false): Promise<{ id: number; live: boolean; maxLeverage: number; feeBps: number }> {
     const cached = this.products.get(symbol);
     if (cached && !force && Date.now() - cached.fetchedAt < 10 * 60_000) return cached;
     const raw = await this.request<Record<string, unknown>>(`/v2/products/${encodeURIComponent(symbol)}`);
@@ -173,13 +171,20 @@ export class DeltaBridge {
     const cv = Number(raw.contract_value);
     const tick = Number(raw.tick_size);
     const im = Number(raw.initial_margin);
-    if (!Number.isSafeInteger(id) || !(cv > 0) || !(tick > 0)) throw new DeltaRequestError(`Delta product ${symbol} metadata was invalid`, 502);
+    if (!Number.isSafeInteger(id) || id <= 0 || ![cv,tick,im].every(n => Number.isFinite(n) && n > 0) || raw.symbol !== symbol) throw new DeltaRequestError(`Delta product ${symbol} metadata was invalid`, 502);
     const spec = specFor(symbol);
     spec.productId = id;
     spec.contractValue = cv;
     spec.tickSize = tick;
     spec.digits = digitsForTick(tick);
-    const info = { id, live: raw.state === "live" && raw.trading_status === "operational", maxLeverage: im > 0 ? Math.floor(100 / im) : 1, fetchedAt: Date.now() };
+    const positionLimit = numeric(raw.position_size_limit);
+    if (Number.isSafeInteger(positionLimit) && positionLimit > 0) spec.maxContracts = positionLimit;
+    const feeBps = Number(raw.taker_commission_rate) * 1.18 * 10_000;
+    const info = { id, live: raw.state === "live" && raw.trading_status === "operational" &&
+      raw.contract_type === "perpetual_futures" && raw.notional_type === "vanilla" && raw.is_quanto === false &&
+      (raw.quoting_asset as {symbol?:string}|undefined)?.symbol === "USD" && (raw.settling_asset as {symbol?:string}|undefined)?.symbol === "USD" &&
+      Number.isSafeInteger(positionLimit) && positionLimit > 0 && raw.taker_commission_rate != null && Number.isFinite(feeBps) && feeBps >= 0,
+      feeBps, maxLeverage: Math.floor(100 / im), fetchedAt: Date.now() };
     this.products.set(symbol, info);
     return info;
   }
@@ -197,8 +202,10 @@ export class DeltaBridge {
       const rows = await this.request<unknown>(`/v2/history/candles?${q.toString()}`);
       if (!Array.isArray(rows)) throw new DeltaRequestError("Delta candle response was invalid", 502);
       for (const r of rows as Array<Record<string, unknown>>) {
-        const bar: Bar = { time: Number(r.time), open: Number(r.open), high: Number(r.high), low: Number(r.low), close: Number(r.close), volume: Number(r.volume ?? 0) };
-        if ([bar.time, bar.open, bar.high, bar.low, bar.close].every(Number.isFinite) && bar.time <= lastClosedOpen && bar.high >= bar.low) byTime.set(bar.time, bar);
+        const bar: Bar = { time: Number(r.time), open: Number(r.open), high: Number(r.high), low: Number(r.low), close: Number(r.close), volume: Number(r.volume) };
+        if (Object.values(bar).every(Number.isFinite) && bar.time % FIVE_MIN === 0 && bar.time >= start && bar.time <= end &&
+          bar.low > 0 && bar.low <= Math.min(bar.open, bar.close) && bar.high >= Math.max(bar.open, bar.close) &&
+          r.volume != null && bar.volume >= 0) byTime.set(bar.time, bar);
       }
       remaining -= chunk;
       end = start - 1;
@@ -207,37 +214,47 @@ export class DeltaBridge {
     return [...byTime.values()].sort((a, b) => a.time - b.time);
   }
 
-  async ticker(symbol: string): Promise<{ mark: number; bid: number; ask: number; spreadPct: number }> {
+  async ticker(symbol: string): Promise<{ mark: number; bid: number; ask: number; spreadPct: number; timestamp: number }> {
     const r = await this.request<Record<string, unknown>>(`/v2/tickers/${encodeURIComponent(symbol)}`);
     const quotes = (r.quotes ?? {}) as Record<string, unknown>;
-    const mark = Number(r.mark_price ?? r.close);
-    const bid = Number(quotes.best_bid);
-    const ask = Number(quotes.best_ask);
-    if (!(mark > 0)) throw new DeltaRequestError(`Delta ticker for ${symbol} had no price`, 502);
-    const spreadPct = bid > 0 && ask > 0 && ask >= bid ? (ask - bid) / ((ask + bid) / 2) * 100 : 0;
-    return { mark, bid: bid || mark, ask: ask || mark, spreadPct };
+    const mark = numeric(r.mark_price);
+    const bid = numeric(quotes.best_bid);
+    const ask = numeric(quotes.best_ask);
+    const timestamp = numeric(r.timestamp) / 1e6;
+    const age = Date.now() / 1000 - timestamp;
+    if (r.symbol !== symbol || ![mark,bid,ask].every(n => n > 0 && Number.isFinite(n)) || ask < bid || !(age >= 0 && age <= 15)) {
+      throw new DeltaRequestError(`Invalid or stale Delta quote for ${symbol}`, 502);
+    }
+    return { mark, bid, ask, timestamp, spreadPct: (ask - bid) / ((ask + bid) / 2) * 100 };
   }
 
   // ------------------------------------------------------------------ account
   async wallet(): Promise<{ balance: number; available: number; asset: string }> {
     const rows = await this.request<Array<Record<string, unknown>>>("/v2/wallet/balances", { auth: true });
     if (!Array.isArray(rows)) throw new DeltaRequestError("Delta wallet response was invalid", 502);
-    const usd = rows.find((w) => w.asset_symbol === "USD") ?? rows.find((w) => w.asset_symbol === "USDT");
-    if (!usd) throw new DeltaRequestError("Delta wallet did not contain a USD or USDT balance", 502);
-    const balance = Number(usd.balance);
-    const available = Number(usd.available_balance);
+    const usd = rows.find((w) => w.asset_symbol === "USD");
+    if (!usd) throw new DeltaRequestError("Delta wallet did not contain a USD balance", 502);
+    const balance = numeric(usd.balance);
+    const available = numeric(usd.available_balance);
     if (usd.balance == null || usd.available_balance == null || !Number.isFinite(balance) || !Number.isFinite(available)) {
       throw new DeltaRequestError("Delta wallet contained invalid balances", 502);
     }
+
     return { balance, available, asset: String(usd.asset_symbol) };
+  }
+
+  async hasWorkingOrders(): Promise<boolean> {
+    const rows = await this.request<unknown>("/v2/orders?states=open,pending&page_size=1", { auth: true });
+    if (!Array.isArray(rows)) throw new DeltaRequestError("Invalid Delta working-order response", 502);
+    return rows.length !== 0;
   }
 
   async positions(symbols?: readonly string[]): Promise<DeltaPosition[]> {
     const rows = await this.request<Array<Record<string, unknown>>>("/v2/positions/margined", { auth: true });
     if (!Array.isArray(rows)) throw new DeltaRequestError("Delta positions response was invalid", 502);
     const positions = await Promise.all(rows.map(async (p): Promise<DeltaPosition | null> => {
-      const size = Number(p.size);
-      if (p.size == null || !Number.isFinite(size)) throw new DeltaRequestError("Delta position had an invalid size", 502);
+      const size = numeric(p.size);
+      if (!Number.isSafeInteger(size)) throw new DeltaRequestError("Delta position had an invalid size", 502);
       if (!size) return null;
       const product = p.product && typeof p.product === "object" ? p.product as Record<string, unknown> : {};
       const symbol = String(p.product_symbol ?? product.symbol ?? "");
@@ -247,14 +264,12 @@ export class DeltaBridge {
       const markPrice = p.mark_price == null ? (await this.ticker(symbol)).mark : Number(p.mark_price);
       let unrealizedPnl: number;
       if (p.unrealized_pnl != null) {
-        unrealizedPnl = Number(p.unrealized_pnl);
+        unrealizedPnl = numeric(p.unrealized_pnl);
       } else {
         // Margined-position responses may omit P/L and mark; value linear contracts from exchange metadata and ticker.
-        let contractValue = Number(product.contract_value);
-        if (!(contractValue > 0)) {
-          await this.loadProduct(symbol);
-          contractValue = specFor(symbol).contractValue;
-        }
+        const meta = await this.loadProduct(symbol);
+        if (!meta.live) throw new DeltaRequestError(`Cannot value ${symbol} using linear USD P/L`, 502);
+        const contractValue = specFor(symbol).contractValue;
         unrealizedPnl = (markPrice - entryPrice) * size * contractValue;
       }
       if (!(entryPrice > 0) || !(markPrice > 0) || ![entryPrice, markPrice, unrealizedPnl].every(Number.isFinite)) {
@@ -274,11 +289,12 @@ export class DeltaBridge {
   async fills(limit = 30): Promise<DeltaFill[]> {
     const rows = await this.request<Array<Record<string, unknown>>>(`/v2/fills?page_size=${Math.max(1, Math.min(limit, 100))}`, { auth: true });
     if (!Array.isArray(rows)) throw new DeltaRequestError("Delta fills response was invalid", 502);
-    return rows.map((f) => {
+    return rows.filter(f => f && (f.side === "buy" || f.side === "sell") && f.id != null).map((f) => {
       const product = f.product && typeof f.product === "object" ? f.product as Record<string, unknown> : {};
       return {
         id: String(f.id), symbol: String(f.product_symbol ?? product.symbol ?? ""), side: f.side === "sell" ? "sell" as const : "buy" as const,
-        size: Number(f.size), price: Number(f.price), commission: Number(f.commission ?? 0), notional: Number(f.notional ?? 0),
+        size: numeric(f.size), price: numeric(f.price), commission: Number.isFinite(numeric(f.commission)) ? numeric(f.commission) : null,
+        notional: Number.isFinite(numeric(f.notional)) ? numeric(f.notional) : null,
         order_id: f.order_id == null ? null : String(f.order_id), role: String(f.role ?? ""), time: Date.parse(String(f.created_at)) / 1000
       };
     }).filter((f) => f.symbol && [f.size, f.price, f.time].every(Number.isFinite));
@@ -297,14 +313,14 @@ export class DeltaBridge {
   }
 
   /**
-   * Market entry with an exchange-side bracket (SL + final target) so the position is never unprotected.
+   * Price-bounded IOC limit entry with exchange-side brackets. Never synthesize a fill.
    * Caller must have claimed the signal for idempotency and obtained Guardian approval.
    */
-  async placeEntry(x: { signalId: string; symbol: string; direction: Direction; contracts: number; stop: number; target: number; leverage: number }): Promise<OrderResult> {
+  async placeEntry(x: { signalId: string; symbol: string; direction: Direction; contracts: number; stop: number; target: number; limit: number }): Promise<OrderResult> {
     const side = x.direction === "LONG" ? "buy" : "sell";
     const clientOrderId = DeltaBridge.clientOrderId(x.signalId);
-    if (!this.isReady()) {
-      const msg = this.cfg.environment === "production" ? "Live trading is locked: orders refused on the real-money account." : "Delta is not ready (credentials or connectivity).";
+    if (!this.isReady() || !this.cfg.maySubmit?.()) {
+      const msg = "Demo execution not armed or healthy.";
       this.log("order_refused", x.symbol, "refused", msg);
       return { ok: false, message: msg, symbol: x.symbol };
     }
@@ -312,93 +328,32 @@ export class DeltaBridge {
       const product = await this.loadProduct(x.symbol);
       if (!product.live) throw new DeltaRequestError(`${x.symbol} is not live/operational on Delta India`, 409);
       const spec = specFor(x.symbol);
-      const tick = await this.ticker(x.symbol);
-      const ref = x.direction === "LONG" ? tick.ask : tick.bid;
-      if ((x.direction === "LONG" && !(x.stop < ref && x.target > ref)) || (x.direction === "SHORT" && !(x.stop > ref && x.target < ref))) {
-        const msg = `Price ${ref} already beyond the plan (SL ${x.stop}, target ${x.target}); order not sent.`;
-        this.log("order_refused", x.symbol, "refused", msg, { price: ref });
-        return { ok: false, message: msg, symbol: x.symbol };
-      }
-      const leverage = Math.max(1, Math.min(x.leverage, product.maxLeverage));
-      await this.request(`/v2/products/${product.id}/orders/leverage`, { method: "POST", auth: true, body: { leverage: String(leverage) } });
       const stop = this.tickRound(x.stop, spec.tickSize, x.direction === "LONG" ? "up" : "down");
       const target = this.tickRound(x.target, spec.tickSize, x.direction === "LONG" ? "down" : "up");
-      this.log("order_send", x.symbol, "pending", `${side.toUpperCase()} ${x.contracts} @ market · SL ${stop} · TP ${target} · ${leverage}x`, { contracts: x.contracts });
+      if (![stop,target,x.limit].every(n => Number.isFinite(n) && n > 0) || !Number.isSafeInteger(x.contracts) || x.contracts <= 0 ||
+        !(side === "buy" ? stop < x.limit && x.limit < target : stop > x.limit && x.limit > target)) throw new Error("Invalid bracket geometry or quantity");
+      this.log("order_send", x.symbol, "pending", `${side.toUpperCase()} IOC @ ${x.limit} · SL ${stop} · TP ${target}`, { contracts: x.contracts });
       const order = await this.request<Record<string, unknown>>("/v2/orders", {
         method: "POST", auth: true,
         body: {
-          product_id: product.id, size: x.contracts, side, order_type: "market_order", client_order_id: clientOrderId,
+          product_id: product.id, size: x.contracts, side, order_type: "limit_order", limit_price: String(x.limit), time_in_force: "ioc", client_order_id: clientOrderId,
           bracket_stop_loss_price: String(stop), bracket_take_profit_price: String(target), bracket_stop_trigger_method: "mark_price"
         }
       });
-      const orderId = order.id as number | string | undefined;
-      const fillPrice = Number(order.average_fill_price ?? 0) || ref;
-      const filled = Number(order.size ?? x.contracts) - Number(order.unfilled_size ?? 0);
-      this.log("order_filled", x.symbol, String(order.state ?? "filled"), `Filled ${filled} contracts @ ${fillPrice}`, { order_id: orderId ?? null, price: fillPrice, contracts: filled });
-      return { ok: true, message: `Order filled on Delta India (${this.accountLabel()})`, symbol: x.symbol, ...(orderId !== undefined ? { orderId } : {}), clientOrderId, price: roundTo(fillPrice, spec.digits), contracts: filled || x.contracts };
+      const orderId = order.id;
+      const fillPrice = Number(order.average_fill_price);
+      if (!["number","string"].includes(typeof orderId) || !orderId || order.state !== "closed" || order.client_order_id !== clientOrderId ||
+        Number(order.product_id) !== product.id || order.side !== side || Number(order.size) !== x.contracts ||
+        numeric(order.unfilled_size) !== 0 || !Number.isFinite(fillPrice) || !(fillPrice > 0)) {
+        throw new Error("Fill not confirmed; inspect Delta order history before another submission");
+      }
+      this.log("order_filled", x.symbol, "filled", `Filled ${x.contracts} contracts @ ${fillPrice}`, { order_id: String(orderId), price: fillPrice, contracts: x.contracts });
+      return { ok: true, message: "Delta demo reports a full fill", symbol: x.symbol, orderId: String(orderId), clientOrderId, price: fillPrice, contracts: x.contracts };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log("order_error", x.symbol, "error", msg);
       return { ok: false, message: msg, symbol: x.symbol };
     }
-  }
-
-  /** Reduce-only market order (partial or full close). */
-  async reduce(symbol: string, direction: Direction, contracts: number, seed: string, reason: string): Promise<OrderResult> {
-    try {
-      const product = await this.loadProduct(symbol);
-      const side = direction === "LONG" ? "sell" : "buy";
-      const order = await this.request<Record<string, unknown>>("/v2/orders", {
-        method: "POST", auth: true,
-        body: { product_id: product.id, size: contracts, side, order_type: "market_order", reduce_only: true, client_order_id: DeltaBridge.clientOrderId(seed) }
-      });
-      const price = Number(order.average_fill_price ?? 0) || null;
-      this.log("reduce", symbol, String(order.state ?? "filled"), `${reason}: closed ${contracts} contracts`, { order_id: order.id as string, price, contracts });
-      return { ok: true, message: `${reason}: closed ${contracts} contracts`, symbol, ...(price ? { price } : {}), contracts };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log("reduce_error", symbol, "error", msg);
-      return { ok: false, message: msg, symbol };
-    }
-  }
-
-  /** Move the exchange-side stop (break-even / trailing). Tries the position bracket, then the stop order itself. */
-  async updateStop(symbol: string, direction: Direction, stop: number, target: number): Promise<boolean> {
-    const product = await this.loadProduct(symbol);
-    const spec = specFor(symbol);
-    const sl = String(this.tickRound(stop, spec.tickSize, direction === "LONG" ? "up" : "down"));
-    const tp = String(this.tickRound(target, spec.tickSize, direction === "LONG" ? "down" : "up"));
-    try {
-      const orders = await this.request<Array<Record<string, unknown>>>(`/v2/orders?product_ids=${product.id}&states=open,pending`, { auth: true });
-      const slOrder = Array.isArray(orders) ? orders.find((o) => o.stop_order_type === "stop_loss_order") : undefined;
-      if (slOrder) {
-        await this.request("/v2/orders", { method: "PUT", auth: true, body: { id: slOrder.id, product_id: product.id, size: slOrder.size, stop_price: sl } });
-      } else {
-        await this.request("/v2/orders/bracket", {
-          method: "POST", auth: true,
-          body: { product_id: product.id, stop_loss_order: { order_type: "market_order", stop_price: sl }, take_profit_order: { order_type: "market_order", stop_price: tp }, bracket_stop_trigger_method: "mark_price" }
-        });
-      }
-      this.log("modify_sl", symbol, "ok", `Stop moved to ${sl}`, { price: Number(sl) });
-      return true;
-    } catch (err) {
-      this.log("modify_sl_error", symbol, "error", err instanceof Error ? err.message : String(err));
-      return false;
-    }
-  }
-
-  async cancelAll(symbol: string): Promise<void> {
-    const product = await this.loadProduct(symbol);
-    await this.request("/v2/orders/all", { method: "DELETE", auth: true, body: { product_id: product.id, cancel_limit_orders: true, cancel_stop_orders: true } });
-  }
-
-  /** Close the position for a symbol at market and cancel its leftover bracket orders. */
-  async closePosition(symbol: string, reason: string): Promise<OrderResult> {
-    const pos = (await this.positions([symbol]))[0];
-    if (!pos) return { ok: false, message: `No open ${symbol} position on Delta`, symbol };
-    const res = await this.reduce(symbol, pos.direction, pos.contracts, `close:${symbol}:${Date.now()}`, reason);
-    if (res.ok) await this.cancelAll(symbol).catch(() => undefined);
-    return res;
   }
 
   private tickRound(value: number, tick: number, mode: "up" | "down"): number {
@@ -432,7 +387,7 @@ export class DeltaBridge {
     } else if (connected) {
       try {
         const w = await this.wallet();
-        account = { ...w, equity: w.balance };
+        account = { ...w, equity: null }; // Wallet alone does not include unrealized position P/L.
       } catch (err) {
         const status = err instanceof DeltaRequestError ? err.status : 0;
         const code = err instanceof DeltaRequestError ? err.code : undefined;
@@ -451,13 +406,9 @@ export class DeltaBridge {
         });
       }
     }
-    if (this.cfg.environment === "production") {
-      if (!this.allowLiveEnv) issues.push({ code: "LIVE_DISABLED", message: "Real-money trading is hard-disabled.", fix: "Set LIVE_TRADING_CONFIRMED=I_UNDERSTAND_REAL_MONEY in .env and restart to allow unlocking." });
-      else if (!this.liveUnlocked) issues.push({ code: "LIVE_LOCKED", message: "Live trading is locked for this session.", fix: `Type "${CONFIRM_PHRASE}" in Settings → Delta to unlock.` });
-    }
     this.lastHealth = {
       available: true, connected, authenticated: account !== null, environment: this.cfg.environment, issues,
-      checked_at: Date.now() / 1000, ping_ms: ping, live_unlocked: this.liveUnlocked, allow_live_env: this.allowLiveEnv, account, products
+      checked_at: t0 / 1000, ping_ms: ping, live_unlocked: false, allow_live_env: false, account, products
     };
     return this.lastHealth;
   }

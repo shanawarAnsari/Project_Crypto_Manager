@@ -15,8 +15,7 @@ const host = process.env.HOST ?? "127.0.0.1";
 const desk = new Desk(cfg, new EventHub());
 const server = createDeskApp(desk).listen(cfg.port, host, () => {
   process.stdout.write(
-    `Crypto Manager desk API on http://${host}:${cfg.port} · Delta ${cfg.deltaEnvironment === "testnet" ? "India DEMO" : "India LIVE"} · ` +
-    `instruments ${cfg.instruments.join(", ")} · analyst ${desk.analyst.mode === "llm" ? cfg.analystModel : "rule-based"}\n`
+    `Crypto Manager desk API on http://${host}:${cfg.port} · Delta India DEMO · instruments ${cfg.instruments.join(", ")} · execution disabled on startup\n`
   );
 });
 const wss = attachDeskSocket(server, desk);

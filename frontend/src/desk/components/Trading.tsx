@@ -1,54 +1,124 @@
 import { useEffect, useState } from "react";
-import { api, dateTime, post, px, pnlClass, time, usd } from "../api";
-import { pushToast, useDesk } from "../store";
-import type { JournalRow } from "../types";
+import { api, dateTime, px, pnlClass, time, usd } from "../api";
+import { useDesk } from "../store";
+import type { JournalRow, TradeRow } from "../types";
 
 const TONE: Record<string, string> = {
   taken: "border-emerald-400/50 text-emerald-300", vetoed: "border-red-500/50 text-red-300", skipped: "border-amber-400/50 text-amber-300", error: "border-red-500/50 text-red-300"
 };
 
 export function Positions() {
-  const positions = useDesk((s) => s.positions);
-  const execution = useDesk((s) => s.execution);
-  const dataSource = useDesk((s) => s.dataSource);
   const account = useDesk((s) => s.account);
-  const displayed = dataSource === "delta" ? account?.positions ?? [] : positions;
+  const displayed = account?.positions ?? [];
   const digits = useDesk((s) => s.digits);
-  const close = async (id: string, instrument: string, venue: string) => {
-    const r = venue === "delta"
-      ? await post<{ ok: boolean; message: string }>(`/api/delta/close/${instrument}`)
-      : await post<{ ok: boolean; message?: string }>(`/api/paper/close/${id}`);
-    if (!r.ok) pushToast({ level: "error", title: "Close failed", message: r.message ?? "" });
-  };
   return (
     <section className="panel">
       <header className="panel-head">
-        <h2 className="panel-title">Open positions · {dataSource === "delta" ? "Delta India account" : "Paper simulation"}</h2>
+        <h2 className="panel-title">Open positions · Delta India account</h2>
         <span className="num text-xs text-terminal-muted">{displayed.length}</span>
       </header>
-      {!displayed.length ? <p className="p-6 text-center text-sm text-terminal-muted">{dataSource === "delta" && (!account?.updated_at || account.error) ? "Account positions unavailable. Check account connection status." : "No open positions."}</p> : (
+      {!displayed.length ? <p className="p-6 text-center text-sm text-terminal-muted">{!account?.updated_at || account.error ? "Account positions unavailable. Check account connection status." : "No open positions."}</p> : (
         <div className="overflow-x-auto">
+          <p className="mb-2 px-4 text-[11px] text-amber-200">Protective stop/target orders are not independently reconciled in this view. Verify them in Delta Demo before relying on them.</p>
           <table className="table">
-            <thead><tr><th>Instrument</th><th>Side</th><th>Contracts</th><th>Entry</th><th>SL</th><th>TP1 / TP2</th><th>{dataSource === "delta" ? "Open P/L (mark)" : "Paper P/L"}</th><th /></tr></thead>
+            <thead><tr><th>Instrument</th><th>Side</th><th>Contracts</th><th>Entry</th><th>Open P/L (mark)</th></tr></thead>
             <tbody>
               {displayed.map((p) => {
                 const dg = digits[p.instrument] ?? 2;
-                const pnl = dataSource === "delta" ? p.unrealized_pnl : p.unrealized_pnl + p.realized_pnl;
+                const pnl = p.unrealized_pnl;
                 return (
                   <tr key={p.id}>
-                    <td className="font-semibold">{p.instrument}{p.tp1_hit && <span className="pill ml-2 border-emerald-400/40 text-emerald-300">TP1 ✓</span>}{p.breakeven && <span className="pill ml-1 border-sky-400/40 text-sky-300">BE</span>}</td>
+                    <td className="font-semibold">{p.instrument}</td>
                     <td className={p.direction === "LONG" ? "text-terminal-green" : "text-terminal-red"}>{p.direction}</td>
-                    <td className="num">{p.volume}{p.volume !== p.initial_volume && <span className="text-terminal-muted"> / {p.initial_volume}</span>}</td>
+                    <td className="num">{p.volume}</td>
                     <td className="num">{px(p.entry_price, dg)}</td>
-                    <td className="num">{p.stop_loss ? px(p.stop_loss, dg) : "—"}</td>
-                    <td className="num">{p.take_profit_1 ? `${px(p.take_profit_1, dg)} / ${px(p.take_profit_2, dg)}` : p.close_reason ?? "—"}</td>
                     <td className={`num font-semibold ${pnlClass(pnl)}`}>{usd(pnl)}</td>
-                    <td>{(p.venue === "paper" || execution === "delta") && <button type="button" className="btn btn-danger px-2 py-1 text-xs" onClick={() => {
-                      if (window.confirm(`Close ${p.instrument} on ${p.venue === "delta" ? "your Delta account" : "paper"}?`)) void close(p.id, p.instrument, p.venue);
-                    }}>Close</button>}</td>
                   </tr>
                 );
               })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function TradeHistory() {
+  const account = useDesk(s => s.account);
+  const tick = useDesk((s) => s.journalTick);
+  const digits = useDesk((s) => s.digits);
+  const [data, setData] = useState<{ decisions: JournalRow[]; trades: TradeRow[] } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError(null);
+    void api<{ decisions: JournalRow[]; trades: TradeRow[] }>("/api/journal?limit=500")
+      .then((result) => { if (active) setData(result); })
+      .catch((cause: unknown) => { if (active) setError(cause instanceof Error ? cause.message : String(cause)); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [tick]);
+
+  const rationaleBySignal = new Map(
+    (data?.decisions ?? []).flatMap((decision) => {
+      const rationale = decision.trace.find((step) => step.agent === "Analyst")?.summary;
+      return decision.signal_id && rationale ? [[decision.signal_id, rationale] as const] : [];
+    })
+  );
+  const duration = (openedAt: number, closedAt: number | null) => {
+    if (closedAt === null) return "Open";
+    const minutes = Math.floor(Math.max(0, closedAt - openedAt) / 60);
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ${minutes % 60}m`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ${hours % 24}h`;
+  };
+  const trades = data?.trades ?? [];
+
+  return (
+    <section className="panel">
+      <header className="panel-head">
+        <h2 className="panel-title">Recent trade history</h2>
+        <span className="text-[11px] text-terminal-muted">Demo account fills and local closed-trade records</span>
+      </header>
+      {loading && !data && <p className="p-6 text-center text-sm text-terminal-muted">Loading trade history…</p>}
+      {error && <p role="alert" className="p-4 text-sm text-terminal-red">Trade history unavailable: {error}</p>}
+      {Boolean(account?.fills?.length) && <div className="max-h-64 overflow-auto">
+        <table className="table"><caption>Latest exchange fills · each row is one execution, not a round-trip profit</caption>
+          <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>Commission</th></tr></thead>
+          <tbody>{account?.fills?.map(f => <tr key={f.id}>
+            <td>{dateTime(f.time)}</td><td>{f.symbol}</td><td>{f.side}</td><td>{f.size}</td><td>{px(f.price, digits[f.symbol] ?? 2)}</td><td>{px(f.commission, 6)}</td>
+          </tr>)}</tbody>
+        </table></div>}
+      {!loading && !error && !trades.length && <p className="p-6 text-center text-sm text-terminal-muted">No closed trades recorded yet.</p>}
+      {trades.length > 0 && (
+        <div className="max-h-[420px] overflow-auto">
+          <table className="table min-w-[1100px]">
+            <thead>
+              <tr><th>Opened</th><th>Closed</th><th>Hold</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P/L</th><th>Why taken</th><th>Exit reason</th></tr>
+            </thead>
+            <tbody>
+              {trades.map((trade) => (
+                <tr key={trade.id}>
+                  <td className="whitespace-nowrap">{dateTime(trade.opened_at)}</td>
+                  <td className="whitespace-nowrap">{trade.closed_at ? dateTime(trade.closed_at) : "—"}</td>
+                  <td className="whitespace-nowrap num">{duration(trade.opened_at, trade.closed_at)}</td>
+                  <td className="font-semibold">{trade.instrument}</td>
+                  <td className={trade.direction === "LONG" ? "text-terminal-green" : "text-terminal-red"}>{trade.direction}</td>
+                  <td className="num">{trade.volume}</td>
+                  <td className="num">{px(trade.entry, digits[trade.instrument] ?? 2)}</td>
+                  <td className="num">{px(trade.exit, digits[trade.instrument] ?? 2)}</td>
+                  <td className={`num font-semibold ${pnlClass(trade.pnl)}`}>{usd(trade.pnl)}</td>
+                  <td className="max-w-[280px] text-terminal-muted" title={rationaleBySignal.get(trade.signal_id ?? "") ?? "No analyst rationale recorded"}>
+                    <span className="line-clamp-2">{rationaleBySignal.get(trade.signal_id ?? "") ?? "No analyst rationale recorded"}</span>
+                  </td>
+                  <td className="text-terminal-muted">{trade.reason ?? "—"}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
@@ -95,18 +165,20 @@ export function SignalFeed() {
 
 export function DeltaStatus() {
   const h = useDesk((s) => s.delta);
-  const env = useDesk((s) => s.deltaEnv);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
   const recheck = async () => {
     setBusy(true);
-    await api("/api/delta/status").catch(() => undefined);
-    setBusy(false);
+    setError("");
+    try { await api("/api/delta/status"); }
+    catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
   };
   const ok = Boolean(h?.connected && h.authenticated && !h.issues.length);
   return (
     <section className="panel">
       <header className="panel-head">
-        <h2 className="panel-title">Delta Exchange India · {env === "testnet" ? "Demo account" : "Live account"}</h2>
+        <h2 className="panel-title">Delta Exchange India Demo account</h2>
         <span className={`pill ${ok ? "border-emerald-400/50 text-emerald-300" : h?.connected ? "border-amber-400/50 text-amber-300" : "border-red-500/50 text-red-300"}`}>
           {ok ? "READY" : h?.connected ? "MARKET DATA ONLY" : "OFFLINE"}
         </span>
@@ -116,7 +188,7 @@ export function DeltaStatus() {
           <div><span className="label">API</span><p>{h?.connected ? `Reachable · ${h.ping_ms ?? "?"}ms` : "Unreachable"}</p></div>
           <div><span className="label">API key</span><p>{h?.authenticated ? "Authenticated" : "Not authenticated"}</p></div>
           <div><span className="label">Wallet ({h?.account?.asset ?? "USD"})</span><p className="num">{h?.account ? `${usd(h.account.balance)} · avail ${usd(h.account.available)}` : "—"}</p></div>
-          <div><span className="label">Live unlock</span><p>{env === "testnet" ? "Not needed (Demo)" : h?.live_unlocked ? "UNLOCKED" : "Locked"}</p></div>
+          <div><span className="label">Production orders</span><p>Not supported</p></div>
         </div>
         {h && Object.entries(h.products).length > 0 && (
           <p className="text-[11px] text-terminal-muted">
@@ -129,6 +201,7 @@ export function DeltaStatus() {
             <p className="text-[11.5px] text-terminal-muted">Fix: {i.fix}</p>
           </div>
         ))}
+        {error && <p role="alert" className="text-terminal-red">{error}</p>}
         <button type="button" className="btn" disabled={busy} onClick={() => void recheck()}>{busy ? "Checking…" : "Re-check connection"}</button>
       </div>
     </section>

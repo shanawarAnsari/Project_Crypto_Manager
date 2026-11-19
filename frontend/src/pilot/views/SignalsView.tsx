@@ -3,24 +3,18 @@ import { useEffect, useState } from "react";
 import { useStore } from "../store/useStore";
 import { Glass } from "../components/Glass";
 import { DeltaExecutionLog, DeltaFills, DeltaStatusCard } from "../components/DeltaPanels";
-import { api, post } from "../lib/api";
+import { api } from "../lib/api";
 import { dateTime, px, usd } from "../lib/format";
-import type { JournalRow, Position } from "../lib/types";
+import type { ExchangePosition, JournalRow } from "../lib/types";
 
-function PositionList({ title, positions, empty }: { title: string; positions: Position[]; empty: string }) {
-  const close = async (p: Position) => {
-    const r = p.venue === "delta"
-      ? await post<{ ok: boolean; message?: string }>(`/api/delta/close/${p.instrument}`)
-      : await post<{ ok: boolean; message?: string }>(`/api/paper/close/${p.id}`);
-    if (!r.ok) useStore.getState().pushToast({ level: "error", title: "Close failed", message: r.message ?? "The position could not be closed." });
-  };
+function PositionList({ title, positions, empty }: { title: string; positions: ExchangePosition[]; empty: string }) {
   return (
     <Glass className="p-4" title={title} right={<span className="num text-xs text-slate-400">{positions.length}</span>}>
       {!positions.length && <p className="py-6 text-center text-sm text-slate-500">{empty}</p>}
       <div className="mt-2 space-y-2">
         <AnimatePresence initial={false}>
           {positions.map((p) => {
-            const pnl = p.unrealized_pnl + p.realized_pnl;
+            const pnl = p.unrealized_pnl;
             return (
               <motion.div key={`${p.venue}-${p.id}`} layout initial={{ opacity: 0, y: 24, scale: 0.96 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, x: 80 }}
                 transition={{ type: "spring", stiffness: 300, damping: 24 }}
@@ -28,18 +22,13 @@ function PositionList({ title, positions, empty }: { title: string; positions: P
                 <span className={`chip ${p.direction === "LONG" ? "border-profit/50 text-emerald-300" : "border-loss/50 text-rose-300"}`}>{p.direction}</span>
                 <div className="min-w-0 flex-1">
                   <div className="font-display text-sm font-semibold text-white">
-                    {p.instrument} <span className="num text-xs text-slate-400">{p.volume}{p.volume !== p.initial_volume ? ` / ${p.initial_volume}` : ""} contracts</span>
-                    {p.tp1_hit && <span className="chip ml-2 border-profit/40 text-[9px] text-emerald-300">TP1 ✓</span>}
-                    {p.breakeven && <span className="chip ml-1 border-cyan-neon/40 text-[9px] text-cyan-200">BE</span>}
-                    {p.close_reason && <span className="ml-2 text-[10px] text-amber-200">{p.close_reason}</span>}
+                    {p.instrument} <span className="num text-xs text-slate-400">{p.volume} contracts</span>
                   </div>
                   <div className="num mt-0.5 text-[11px] text-slate-400">
-                    @ {px(p.entry_price, p.instrument)} · SL {p.stop_loss ? px(p.stop_loss, p.instrument) : "—"} · TP {p.take_profit_1 ? `${px(p.take_profit_1, p.instrument)} / ${px(p.take_profit_2, p.instrument)}` : "—"}
+                    Entry {px(p.entry_price, p.instrument)} · Mark {px(p.mark_price, p.instrument)}
                   </div>
                 </div>
                 <div className={`num text-sm font-semibold ${pnl >= 0 ? "text-profit" : "text-loss"}`}>{pnl >= 0 ? "+" : ""}{usd(pnl)}</div>
-                <button onClick={() => void close(p).catch(() => undefined)} data-cursor="Close trade" className="btn-danger px-2.5 py-1 text-xs"
-                  title={p.venue === "delta" ? "Sends a reduce-only market order to Delta India" : "Closes the paper position at the last price"}>Close</button>
               </motion.div>
             );
           })}
@@ -78,8 +67,6 @@ function SignalFeed() {
 }
 
 export function SignalsView() {
-  const positions = useStore((s) => s.positions);
-  const execution = useStore((s) => s.execution);
   const account = useStore((s) => s.account);
   const env = useStore((s) => s.deltaEnv);
   const tag = env === "testnet" ? "DEMO" : "LIVE";
@@ -87,7 +74,6 @@ export function SignalsView() {
   return (
     <div className="grid h-full grid-cols-1 gap-3 overflow-y-auto pb-2 xl:grid-cols-2">
       <div className="flex min-h-0 flex-col gap-3">
-        {execution === "paper" && <PositionList title="Open positions · Paper simulation" positions={positions} empty="Flat. Approved signals will animate in here." />}
         <PositionList title={`Delta India ${tag} account positions (synced every 3s)`} positions={account?.positions ?? []} empty={accountEmpty} />
         <div className="min-h-[300px] flex-1"><SignalFeed /></div>
       </div>
